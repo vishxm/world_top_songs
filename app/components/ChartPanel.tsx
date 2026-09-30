@@ -41,7 +41,9 @@ interface Props {
   loading: boolean;
   error: string | null;
   kind: ChartKind;
-  activeIndex: number | null;
+  /** videoId of the playing track, or null. Not an index: the player's queue is
+   *  independent of this list, so positions do not correspond. */
+  activeVideoId: string | null;
   isPlaying: boolean;
   isPaused: boolean;
   onTab: (k: ChartKind) => void;
@@ -60,7 +62,7 @@ export default memo(function ChartPanel({
   loading,
   error,
   kind,
-  activeIndex,
+  activeVideoId,
   isPlaying,
   isPaused,
   onTab,
@@ -177,7 +179,7 @@ export default memo(function ChartPanel({
                 key={`${track.videoId}-${i}`}
                 track={track}
                 index={i}
-                isActive={i === activeIndex}
+                isActive={track.videoId === activeVideoId}
                 isPlaying={isPlaying}
                 isPaused={isPaused}
                 onPlay={onPlay}

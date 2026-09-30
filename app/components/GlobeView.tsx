@@ -1,5 +1,14 @@
 import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { BufferGeometry, Float32BufferAttribute, LineBasicMaterial, LineSegments } from "three";
+import {
+  BufferGeometry,
+  Float32BufferAttribute,
+  LineBasicMaterial,
+  LineSegments,
+  Object3D,
+  Ray,
+  Raycaster,
+  Vector2,
+} from "three";
 import type { Region } from "~/lib/countryMeta";
 import type { ThemeTokens } from "~/hooks/useTheme";
 
@@ -26,16 +35,22 @@ export interface StageCountry {
 // uniform mesh scale of `1 + alt`. So `alt = 0` puts the cap exactly coplanar
 // with the globe mesh, which (a) z-fights and (b) makes the raycast numerically
 // unstable, so hovering/clicking silently drops a large, random-looking share of
-// countries. three-globe's own default is 0.01 for this reason. The lowest value
-// here (CAP_BASE) must stay above the border layer's radius too, so a cap is
-// always the nearest hit and the borders can never steal a hover.
+// countries. three-globe's own default is 0.01 for this reason. The value here
+// must also stay above the border layer's radius so a cap is always the nearest
+// hit and the borders can never steal a hover.
+//
+// HOVER MUST NOT LIFT. Because altitude is a scale, raising it grows the cap
+// outward: a 2% lift adds several pixels of apparent size, so the hovered
+// country bleeds over its neighbours and captures the cursor from them. Hover is
+// signalled by colour alone; only the selection changes geometry.
 // ---------------------------------------------------------------------------
 const CAP_BASE = 0.004;
-const CAP_HOVER = 0.02;
-const CAP_SELECTED = 0.034;
+const CAP_SELECTED = 0.03;
 
-// The border layer sits just off the globe surface. Below every cap, above 0.
-const BORDER_ALTITUDE = 0.0012;
+// The border layer sits just off the globe surface. Above the sphere itself
+// (never 0 — that is the coplanarity trap) and below every cap, so it is always
+// the farthest hit and can never steal a hover.
+const BORDER_ALTITUDE = 0.002;
 
 const GLOBE_RADIUS = 100;
 const IDLE_SPIN_DELAY_MS = 5200;
@@ -59,6 +74,57 @@ function toCartesian(lng: number, lat: number, altitude: number, out: [number, n
   out[0] = r * s * Math.cos(theta);
   out[1] = r * Math.cos(phi);
   out[2] = r * s * Math.sin(theta);
+}
+
+/** three-globe tags every object it generates; walk up to the nearest tag. */
+function globeTypeOf(obj: Object3D | null): string | null {
+  let o: (Object3D & { __globeObjType?: string }) | null = obj;
+  while (o) {
+    if (o.__globeObjType) return o.__globeObjType;
+    o = o.parent as (Object3D & { __globeObjType?: string }) | null;
+  }
+  return null;
+}
+
+/** The `StageCountry` three-globe stored on a hit cap, if any. */
+function datumOf(obj: Object3D | null): StageCountry | null {
+  type Tagged = Object3D & { __data?: { data?: StageCountry } };
+  let o = obj as Tagged | null;
+  while (o) {
+    const datum = o.__data?.data;
+    if (datum?.iso) return datum;
+    o = o.parent as Tagged | null;
+  }
+  return null;
+}
+
+/**
+ * Distance from the ray origin to where it meets the globe's own surface, or
+ * `Infinity` if it never does.
+ *
+ * The planet is the occluder for everything behind it, so "is this cap visible?"
+ * reduces to a scalar comparison. Solving `|o + t·d| = R` directly is both exact
+ * and free — raycasting the sphere mesh instead drags the 120k-segment border
+ * layer and the graticule grid through the loop, which cost 2ms per pick against
+ * 0.09ms for the caps alone.
+ *
+ * `Infinity` and not a small number when the ray misses. The caps are lifted
+ * above the sphere, so a sliver of every cap sits *outside* the planet's
+ * silhouette and is genuinely visible against the sky there; a ray that misses
+ * the sphere has no occluder in front of it, so whatever cap it does hit is a
+ * near-limb cap and must be pickable. Returning a near distance instead dropped
+ * a band of countries around the limb (Germany, the UK, France, Algeria,
+ * Brazil) from hover entirely. Note this cannot let a far-side cap through: any
+ * ray that reaches one has passed through the globe, so it always has an
+ * occluder in front of it.
+ */
+function surfaceDistance(ray: Ray): number {
+  const o = ray.origin;
+  const d = ray.direction;
+  const b = o.dot(d);
+  const c = o.dot(o) - GLOBE_RADIUS * GLOBE_RADIUS;
+  const disc = b * b - c;
+  return disc < 0 ? Infinity : -b - Math.sqrt(disc);
 }
 
 interface Props {
@@ -100,12 +166,29 @@ export default function GlobeView({
   const globeRef = useRef<any>(null);
   const [dimensions, setDimensions] = useState({ w: 0, h: 0 });
   const [mounted, setMounted] = useState(false);
+  const [sceneReady, setSceneReady] = useState(false);
 
   // Hover bookkeeping lives in refs so a pointer storm never re-renders the route.
   const lastHoverIso = useRef<string | null>(null);
-  const pendingHover = useRef<StageCountry | null>(null);
-  const hoverRaf = useRef(0);
   const idleTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  /** Mirrors `selectedIso` so the idle timer can re-check it without being
+   *  re-created (and re-armed) on every selection. */
+  const selectedIsoRef = useRef<string | null>(selectedIso);
+  selectedIsoRef.current = selectedIso;
+  /** Mirrors `hoverIso`, written synchronously by the pick loop. */
+  const hoverIsoRef = useRef<string | null>(hoverIso);
+  /** Raycast plumbing, built once the canvas exists. */
+  const picker = useRef<{
+    el: HTMLCanvasElement;
+    scene: Object3D;
+    caps: Object3D[];
+    capsScannedAt: number;
+    rc: Raycaster;
+    ndc: Vector2;
+  } | null>(null);
+  /** Last pointer position in client coords, or null when it left the canvas. */
+  const pointer = useRef<{ x: number; y: number } | null>(null);
+  const pickRaf = useRef(0);
 
   useEffect(() => {
     setMounted(true);
@@ -114,7 +197,6 @@ export default function GlobeView({
     window.addEventListener("resize", update);
     return () => {
       window.removeEventListener("resize", update);
-      if (hoverRaf.current) cancelAnimationFrame(hoverRaf.current);
       if (idleTimer.current) clearTimeout(idleTimer.current);
     };
   }, []);
@@ -131,20 +213,29 @@ export default function GlobeView({
     }
   }, []);
 
+  // Idle spin only ever applies to an *unselected* globe. A selection parks it
+  // permanently: the user is reading that country's chart and a rotating globe
+  // yanks the country out from under the header readout.
   const scheduleIdleSpin = useCallback(() => {
-    if (reducedMotion) return;
+    if (reducedMotion || selectedIso) return;
     if (idleTimer.current) clearTimeout(idleTimer.current);
     idleTimer.current = setTimeout(() => {
-      // Never resume under a selection — the user is reading a chart.
-      if (!globeRef.current) return;
+      // Re-check at fire time: a selection may have happened while we waited.
+      if (!globeRef.current || selectedIsoRef.current) return;
       setSpinning(true);
     }, IDLE_SPIN_DELAY_MS);
-  }, [reducedMotion, setSpinning]);
+  }, [reducedMotion, selectedIso, setSpinning]);
 
-  // A selection parks the globe; hovering any more keeps it parked.
+  // A selection parks the globe, permanently. Dragging still works — only the
+  // idle rotation is disabled, since that is the part that fights the panel.
   useEffect(() => {
-    setSpinning(!selectedIso && !reducedMotion);
-    if (!selectedIso) scheduleIdleSpin();
+    if (selectedIso) {
+      if (idleTimer.current) clearTimeout(idleTimer.current);
+      setSpinning(false);
+      return;
+    }
+    if (reducedMotion) return;
+    scheduleIdleSpin();
     return () => {
       if (idleTimer.current) clearTimeout(idleTimer.current);
     };
@@ -170,19 +261,31 @@ export default function GlobeView({
   const handleReady = useCallback(() => {
     tuneControls();
     setSpinning(!selectedIso && !reducedMotion);
+    setSceneReady(true);
     // Debug hook: lets console probes inspect the three scene (draw calls, mesh
     // counts, manual raycasts). Harmless in prod.
     (window as unknown as { __globe?: unknown }).__globe = globeRef.current;
   }, [selectedIso, reducedMotion, setSpinning, tuneControls]);
 
+  /**
+   * Fly the camera to the focused country.
+   *
+   * Gated on `sceneReady` as well as `focus`, because the two arrive in either
+   * order: the Globe is lazy and its texture is async, so on a deep link
+   * (`?c=IN`) the route commits the focus *before* three-globe exists. Firing
+   * only on `focus` silently dropped the flight and left the camera at 0,0 —
+   * the country you linked to was off-screen with the panel describing it.
+   */
+  const appliedFocusN = useRef(0);
   useEffect(() => {
-    if (focus && globeRef.current) {
-      globeRef.current.pointOfView(
-        { lat: focus.lat, lng: focus.lng, altitude: focus.altitude },
-        reducedMotion ? 0 : 1150
-      );
-    }
-  }, [focus, reducedMotion]);
+    if (!sceneReady || !focus || !globeRef.current) return;
+    if (appliedFocusN.current === focus.n) return;
+    appliedFocusN.current = focus.n;
+    globeRef.current.pointOfView(
+      { lat: focus.lat, lng: focus.lng, altitude: focus.altitude },
+      reducedMotion ? 0 : 1150
+    );
+  }, [focus, sceneReady, reducedMotion]);
 
   // ------------------------------------------------------------ border layer
   // One LineSegments for every border in the map: a single draw call, full
@@ -208,7 +311,7 @@ export default function GlobeView({
         new LineBasicMaterial({
           color: palette.border,
           transparent: true,
-          opacity: 0.55,
+          opacity: 0.85,
           depthWrite: false,
         })
       );
@@ -224,19 +327,24 @@ export default function GlobeView({
   // were still mid-rescale when the next raycast fired — which shows up as
   // hovering picking the wrong country. Hover styling is applied imperatively
   // instead (see applyHoverVisuals); these only read the initial state.
-  const initialSelected = useRef(selectedIso);
-  const initialRegion = useRef(regionFilter);
+  // Read the *current* values through refs, but keep the accessors' identity
+  // stable forever. These run during three-globe's digest, so a fresh closure per
+  // hover would rebuild every polygon's geometry on every pointer move.
+  const selectedForDigest = useRef(selectedIso);
+  selectedForDigest.current = selectedIso;
+  const regionForDigest = useRef(regionFilter);
+  regionForDigest.current = regionFilter;
 
   const getAltitude = useCallback(
-    (d: unknown) => ((d as StageCountry).iso === initialSelected.current ? CAP_SELECTED : CAP_BASE),
+    (d: unknown) => ((d as StageCountry).iso === selectedForDigest.current ? CAP_SELECTED : CAP_BASE),
     []
   );
 
   const getCapColor = useCallback(
     (d: unknown) => {
       const c = d as StageCountry;
-      if (c.iso === initialSelected.current) return palette.capSelected;
-      if (initialRegion.current && c.region !== initialRegion.current) return palette.capDim;
+      const region = regionForDigest.current;
+      if (region && c.region !== region) return palette.capDim;
       return palette.cap;
     },
     [palette]
@@ -244,33 +352,56 @@ export default function GlobeView({
 
   /**
    * Apply hover/selection visuals straight to the three objects three-globe
-   * built. This is a few property writes instead of a 270-geometry rebuild, so
-   * hover stays cheap and the raycast always sees final geometry.
+   * built — a few property writes instead of a 270-geometry rebuild.
    *
-   * three-globe applies altitude as `scale = 1 + alt`, so the lift is just a
-   * uniform scale on the cap mesh.
+   * This is deliberately NOT a React effect. An effect runs a frame or two after
+   * the hover state changes, so the cap under the pointer is briefly styled for
+   * wherever the pointer *was*. Calling it synchronously with the hover update
+   * keeps geometry and pick in step.
+   *
+   * Reaches the caps through the scene rather than a three-globe method:
+   * `globeGroup()` is not part of the public API, so calling it silently no-ops
+   * and no highlight ever appears.
    */
   const applyHoverVisuals = useCallback(() => {
-    const group = globeRef.current?.globeGroup?.();
-    if (!group) return;
-    for (const obj of group.children) {
-      const iso = obj.__data?.data?.iso;
-      if (typeof iso !== "string") continue;
-      const lift = iso === selectedIso ? CAP_SELECTED : iso === hoverIso ? CAP_HOVER : CAP_BASE;
+    const scene = globeRef.current?.scene?.();
+    if (!scene) return;
+    const selected = selectedIsoRef.current;
+    const hovered = hoverIsoRef.current;
+    scene.traverse((obj: unknown) => {
+      const g = obj as {
+        __globeObjType?: string;
+        __data?: { data?: { iso?: string } };
+        children?: { scale?: { setScalar: (n: number) => void }; material?: unknown }[];
+      };
+      if (g.__globeObjType !== "polygon") return;
+      const iso = g.__data?.data?.iso;
+      if (typeof iso !== "string") return;
+
+      const isSelected = iso === selected;
+      const isHovered = iso === hovered;
+      // Hover deliberately keeps the base altitude — see the note on CAP_BASE.
+      const lift = isSelected ? CAP_SELECTED : CAP_BASE;
       const scale = 1 + lift;
-      const cap = obj.children[0];
-      if (cap) cap.scale.setScalar(scale);
-      const stroke = obj.children[1];
-      // three-globe keeps strokes a hair above the cap; we draw borders in the
-      // merged layer, so the stroke mesh stays hidden but keeps its offset.
-      if (stroke && stroke.visible) stroke.scale.setScalar(scale + 1e-4);
+
+      // children[0] is the cap Mesh, children[1] the (hidden) stroke.
+      const cap = g.children?.[0];
+      cap?.scale?.setScalar(scale);
+      const stroke = g.children?.[1];
+      if (stroke?.scale) stroke.scale.setScalar(scale + 1e-4);
+
+      // Cap material is index 1; index 0 is the side wall. three-globe makes a
+      // fresh material per polygon, so writing it here is safe and avoids
+      // re-digesting every polygon just to change one colour.
       const mat = cap?.material;
       if (Array.isArray(mat)) {
-        const m = mat[1];
-        if (m && m.__hoverTarget !== (iso === selectedIso || iso === hoverIso)) {
-          m.__hoverTarget = iso === selectedIso || iso === hoverIso;
-          const colour = iso === selectedIso ? palette.capSelected : iso === hoverIso ? palette.capHover : palette.cap;
-          const rgba = parseRgba(colour);
+        const m = mat[1] as
+          | { color?: { setHex: (h: number) => void }; opacity: number; transparent: boolean }
+          | undefined;
+        if (m?.color) {
+          const rgba = parseRgba(
+            isSelected ? palette.capSelected : isHovered ? palette.capHover : palette.cap
+          );
           if (rgba) {
             m.color.setHex(rgba[0]);
             m.opacity = rgba[1];
@@ -278,11 +409,17 @@ export default function GlobeView({
           }
         }
       }
-    }
-  }, [selectedIso, hoverIso, palette]);
+    });
+  }, [palette]);
 
+  /** Repaint when the *selection* changes. Hover is handled synchronously in
+   *  the pointer handler; it must not also run here or the two would fight. */
   useEffect(() => {
     applyHoverVisuals();
+    // three-globe builds the polygon objects asynchronously, so repaint once more
+    // shortly after mount in case the layer was not ready on the first pass.
+    const retry = setTimeout(applyHoverVisuals, 400);
+    return () => clearTimeout(retry);
   }, [applyHoverVisuals]);
 
   // Borders own the outline; three-globe's per-country strokes would cost a draw
@@ -291,54 +428,148 @@ export default function GlobeView({
   const noSide = useCallback(() => null, []);
   const getLabel = useCallback(() => "", []);
 
-  /**
-   * Which objects may win a hover.
-   *
-   * three-globe's default picks the *nearest* raycast hit, but the globe sphere
-   * sits at radius 100 while the caps are lifted to 100.x — so the sphere is
-   * always nearer and `find()` never reaches the country sitting on it. Reject
-   * `globe` here and the cap (or, over ocean, nothing) wins instead. The border
-   * layer is rejected for the same reason: it is a single merged LineSegments
-   * that must never steal a hover from a cap.
-   */
-  const pointerEventsFilter = useCallback(
-    (o: unknown) => {
-      const type = (o as { __globeObjType?: string } | null)?.__globeObjType;
-      return type !== "globe" && type !== "custom";
-    },
-    []
-  );
-
   // ------------------------------------------------------------------ events
-  const handleHover = useCallback(
-    (d: unknown) => {
-      // Coalesce to one React update per frame, always forwarding the LATEST
-      // datum, so sweeping within one country costs nothing and stopping over a
-      // country can never leave a stale neighbour on screen.
-      pendingHover.current = (d as StageCountry | null) ?? null;
-      if (hoverRaf.current) return;
-      hoverRaf.current = requestAnimationFrame(() => {
-        hoverRaf.current = 0;
-        const c = pendingHover.current;
-        const iso = c?.iso ?? null;
-        if (iso === lastHoverIso.current) return;
-        lastHoverIso.current = iso;
-        document.body.style.cursor = c ? "pointer" : "";
-        onHover(c);
-        if (c) scheduleIdleSpin();
+  // WE OWN THE PICK. three-render-objects' `hoverFilter` is handed the hit
+  // *object* but never the hit *distance*, and its `find()` then returns the
+  // first hit that passes. Because the sphere is always nearer than the lifted
+  // caps, the only way to reach a country is to reject the sphere — and once it
+  // is rejected the scan keeps going and returns a cap on the FAR side of the
+  // planet. That is not a theoretical concern: it reported Tanzania for pixels
+  // over Brazil and Bolivia over Brazil, with no highlight drawn at all.
+  //
+  // Owning the raycast lets the planet be the occluder it physically is: a cap
+  // counts only if it is in front of the globe's surface (surfaceDistance), and
+  // hits come back sorted near→far so the first surviving cap is the answer.
+  //
+  // Only the caps are raycast. The atmosphere shell, the merged 120k-vertex
+  // border layer, the graticules and the star field are all transparent to the
+  // pointer by design — including them cost 2ms per pick, versus 0.09ms here.
+  const pickAt = useCallback((clientX: number, clientY: number): StageCountry | null => {
+    const p = picker.current;
+    const g = globeRef.current;
+    if (!p || !g) return null;
+    const rect = p.el.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return null;
+    if (clientX < rect.left || clientX > rect.right || clientY < rect.top || clientY > rect.bottom) {
+      return null;
+    }
+    // three-globe builds the caps asynchronously and re-digests them whenever
+    // the data changes, so the list is refreshed about once a second rather than
+    // assumed. A scene traverse is ~0.05ms; a stale list is a dead continent.
+    const now = Date.now();
+    if (now - p.capsScannedAt > 1000) {
+      p.capsScannedAt = now;
+      p.caps.length = 0;
+      p.scene.traverse((o) => {
+        if (globeTypeOf(o) === "polygon") p.caps.push(o);
       });
+    }
+    if (p.caps.length === 0) return null;
+
+    p.ndc.set(
+      ((clientX - rect.left) / rect.width) * 2 - 1,
+      -((clientY - rect.top) / rect.height) * 2 + 1
+    );
+    p.rc.setFromCamera(p.ndc, g.camera());
+    const hit = p.rc.intersectObjects(p.caps, true)[0];
+    // No cap, or the cap is on the far side of the planet: nothing to pick.
+    if (!hit || hit.distance >= surfaceDistance(p.rc.ray)) return null;
+    return datumOf(hit.object);
+  }, []);
+
+  /** Push the picked country into React + the cap materials, coalesced to a
+   *  frame. Returns true when the hover actually changed. */
+  const commitHover = useCallback(
+    (c: StageCountry | null) => {
+      const iso = c?.iso ?? null;
+      if (iso === lastHoverIso.current) return false;
+      lastHoverIso.current = iso;
+      // Styling happens in the SAME frame as the hover change, so the cap under
+      // the pointer is already correct before the next raycast reads geometry.
+      hoverIsoRef.current = iso;
+      applyHoverVisuals();
+      if (picker.current) picker.current.el.style.cursor = c ? "pointer" : "";
+      onHover(c);
+      if (c) scheduleIdleSpin();
+      return true;
     },
-    [onHover, scheduleIdleSpin]
+    [onHover, applyHoverVisuals, scheduleIdleSpin]
   );
 
-  const handleClick = useCallback(
-    (d: unknown) => {
-      const c = d as StageCountry;
-      if (!c?.iso) return;
-      onSelect(c);
-    },
-    [onSelect]
-  );
+  useEffect(() => {
+    if (!sceneReady) return;
+    const g = globeRef.current;
+    const el = g?.renderer?.()?.domElement as HTMLCanvasElement | undefined;
+    if (!el) return;
+    picker.current = { el, scene: g.scene(), caps: [], capsScannedAt: 0, rc: new Raycaster(), ndc: new Vector2() };
+
+    let downAt: { x: number; y: number } | null = null;
+    let dragged = false;
+
+    const onMove = (e: PointerEvent) => {
+      if (downAt && Math.hypot(e.clientX - downAt.x, e.clientY - downAt.y) > 4) dragged = true;
+      pointer.current = { x: e.clientX, y: e.clientY };
+      if (dragged) {
+        // A drag moves the country out from under the cursor, so any highlight
+        // left on screen is already a lie.
+        commitHover(null);
+        return;
+      }
+      schedulePick();
+    };
+    const onDown = (e: PointerEvent) => {
+      downAt = { x: e.clientX, y: e.clientY };
+      dragged = false;
+    };
+    const onUp = (e: PointerEvent) => {
+      downAt = null;
+      if (dragged) {
+        dragged = false;
+        // The `change` handler below re-picks through the damping glide.
+        schedulePick();
+        return;
+      }
+      const c = pickAt(e.clientX, e.clientY);
+      if (c) onSelect(c);
+    };
+    const onLeave = () => {
+      pointer.current = null;
+      commitHover(null);
+    };
+    // Any camera movement re-resolves the hover. This is what keeps the readout
+    // honest through inertia, zoom, auto-rotation and the flight to a newly
+    // selected country — none of which move the pointer, so a pointer-only
+    // listener would leave it naming a country that has since slid away.
+    const onCameraChange = () => schedulePick();
+
+    el.addEventListener("pointermove", onMove);
+    el.addEventListener("pointerdown", onDown);
+    el.addEventListener("pointerup", onUp);
+    el.addEventListener("pointercancel", onLeave);
+    el.addEventListener("pointerleave", onLeave);
+    g.controls()?.addEventListener("change", onCameraChange);
+    return () => {
+      el.removeEventListener("pointermove", onMove);
+      el.removeEventListener("pointerdown", onDown);
+      el.removeEventListener("pointerup", onUp);
+      el.removeEventListener("pointercancel", onLeave);
+      el.removeEventListener("pointerleave", onLeave);
+      g.controls()?.removeEventListener("change", onCameraChange);
+      picker.current = null;
+      if (pickRaf.current) cancelAnimationFrame(pickRaf.current);
+    };
+  }, [sceneReady, commitHover, pickAt, onSelect]);
+
+  /** Run the pick on the next frame. Idempotent — many callers, one raycast. */
+  function schedulePick() {
+    if (pickRaf.current) return;
+    pickRaf.current = requestAnimationFrame(() => {
+      pickRaf.current = 0;
+      const p = pointer.current;
+      if (!p) return;
+      commitHover(pickAt(p.x, p.y));
+    });
+  }
 
   const rings = useMemo(() => {
     const sel = countries.find((c) => c.iso === selectedIso);
@@ -369,10 +600,10 @@ export default function GlobeView({
         polygonStrokeColor={noStroke}
         polygonLabel={getLabel}
         polygonsTransitionDuration={reducedMotion ? 0 : 200}
-        onPolygonHover={handleHover}
-        onPolygonClick={handleClick}
-        pointerEventsFilter={pointerEventsFilter}
-        lineHoverPrecision={0.06}
+        // We raycast the scene ourselves (see pickAt) — three-render-objects'
+        // filter cannot express "stop at the sphere", which is what keeps it
+        // from picking countries on the far side of the planet.
+        enablePointerInteraction={false}
         // Detail layer: every 50m border, one object, one draw call.
         customLayerData={borderData}
         customThreeObject={createBorderLayer}

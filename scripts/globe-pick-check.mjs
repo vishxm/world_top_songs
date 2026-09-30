@@ -12,10 +12,10 @@ import { chromium } from "playwright";
 
 const URL_ = process.argv[2] ?? "http://localhost:5173/?c=US";
 const MIN_RATE = 0.97;
-/** Adjacent countries are simplified independently, so their coastlines do not
- *  abut perfectly. A pixel right on a coast can legitimately pick the
- *  neighbour; only a larger share of that would indicate a real mis-pick. */
-const MAX_WRONG = 0.06;
+/** The app must agree with its own scene. The only allowance is the frame of
+ *  slop between our raycast and the app's rAF-coalesced one, which matters on
+ *  shared borders where the two sides are within a pixel of each other. */
+const MAX_WRONG = 0.01;
 const STEP = 19; // px between samples; co-prime-ish with the grid to avoid aliasing
 
 const browser = await chromium.launch();
@@ -30,58 +30,156 @@ await page.evaluate(() => {
   window.__globe.controls().autoRotate = false;
 });
 
-/** Screen pixels whose nearest hit is a country cap, with the country's ISO. */
-const samples = await page.evaluate(async (step) => {
-  const THREE = await import("/node_modules/three/build/three.module.js");
+/**
+ * The pick the scene says a pixel should produce.
+ *
+ * This is deliberately an independent reimplementation of the rule rather than
+ * a call into the app: hits are sorted near→far, the first country cap wins, and
+ * the globe sphere terminates the search because everything past it is on the
+ * far side of the planet. The atmosphere shell, the merged border layer and the
+ * selection rings are transparent to the pointer by design.
+ */
+const ORACLE = `
+  const typeOf = (o) => { while (o) { if (o.__globeObjType) return o.__globeObjType; o = o.parent; } return null; };
+  const datumOf = (o) => { while (o) { const d = o.__data && o.__data.data; if (d && d.iso) return d; o = o.parent; } return null; };
+  function oracle(THREE, globe, px, py, W, H) {
+    const rc = new THREE.Raycaster();
+    rc.setFromCamera(new THREE.Vector2((px / W) * 2 - 1, -(py / H) * 2 + 1), globe.camera());
+    for (const hit of rc.intersectObject(globe.scene(), true)) {
+      const type = typeOf(hit.object);
+      if (type === "polygon") { const d = datumOf(hit.object); return d ? d.iso : null; }
+      if (type === "globe") return null;
+    }
+    return null;
+  }
+  window.__oracle = oracle;
+`;
+
+/**
+ * The oracle needs a `Raycaster`, and `three` is bundled into the app rather
+ * than exposed on `window`. Vite serves it as a real module from the dev server,
+ * so borrow it from there — trying the page's own origin first means this also
+ * works against a production server, as long as a dev server is running.
+ */
+const THREE_URLS = [
+  "/node_modules/three/build/three.module.js",
+  "http://localhost:5173/node_modules/three/build/three.module.js",
+];
+
+const threeSource = await page.evaluate(async (urls) => {
+  for (const url of urls) {
+    try {
+      await import(/* @vite-ignore */ url);
+      return url;
+    } catch {
+      /* try the next one */
+    }
+  }
+  return null;
+}, THREE_URLS);
+if (!threeSource) {
+  throw new Error(
+    `could not load three for the oracle. Tried:\n  ${THREE_URLS.join("\n  ")}\n` +
+      `Start a dev server (npm run dev) and re-run.`
+  );
+}
+
+// Install the oracle once. `three` is stashed on `window` so the per-pixel
+// evaluates below stay synchronous and cheap; we only borrow the Raycaster.
+await page.evaluate(
+  async ([src, url]) => {
+    window.__THREE = await import(/* @vite-ignore */ url);
+    // eslint-disable-next-line no-eval
+    eval(src);
+  },
+  [ORACLE, threeSource]
+);
+
+/** Expected pick for a screen pixel, measured against the scene *as it is right
+ *  now* (the selection lift changes geometry under a stationary pointer). */
+const expectedAt = (x, y) =>
+  page.evaluate(
+    ([px, py]) => window.__oracle(window.__THREE, window.__globe, px, py, innerWidth, innerHeight),
+    [x, y]
+  );
+
+/**
+ * Screen points to test, split by what the scene says is there:
+ *   land  — a near-side cap. The app must name it.
+ *   ocean — the globe surface, no cap. The app must name NOTHING. This is the
+ *           regression guard for the far-side bug: the library's filter could
+ *           only reject the sphere, so the scan ran on past it and reported
+ *           countries on the far side of the planet (Tanzania for a pixel over
+ *           Brazil) with nothing highlighted on screen at all.
+ */
+const { land, ocean } = await page.evaluate((step) => {
+  const THREE = window.__THREE;
   const globe = window.__globe;
-  const cam = globe.camera();
-  const scene = globe.scene();
   const W = window.innerWidth;
   const H = window.innerHeight;
-  const group = scene.children.find((c) => c.constructor.name === "Globe");
+  const typeOf = (o) => {
+    while (o) {
+      if (o.__globeObjType) return o.__globeObjType;
+      o = o.parent;
+    }
+    return null;
+  };
   const rc = new THREE.Raycaster();
-  const out = [];
+  const land = [];
+  const ocean = [];
   for (let y = 100; y < H - 100; y += step) {
     for (let x = 80; x < W - 80; x += step) {
-      rc.setFromCamera(new THREE.Vector2((x / W) * 2 - 1, -(y / H) * 2 + 1), cam);
-      const hits = rc.intersectObjects([group], true);
-      let capHit = null;
-      let globeHit = null;
-      for (const h of hits) {
-        let o = h.object;
-        while (o && !Object.prototype.hasOwnProperty.call(o, "__globeObjType")) o = o.parent;
-        if (!o) continue;
-        const type = o.__globeObjType;
-        // The merged border layer and the atmosphere shell are never the pick.
-        if (type === "custom" || type === "atmosphere") continue;
-        if (type === "globe" && !globeHit) globeHit = h;
-        else if (type === "polygon" && !capHit) capHit = h;
+      if (window.__oracle(THREE, globe, x, y, W, H)) {
+        land.push([x, y]);
+        continue;
       }
-      // Only near-side caps: one behind the sphere is not a visible country.
-      if (capHit && (!globeHit || capHit.distance < globeHit.distance)) {
-        // __data lives on the polygon Group, not on the hit Mesh child.
-        let g = capHit.object;
-        while (g && !g.__data) g = g.parent;
-        const datum = g && g.__data && g.__data.data;
-        if (datum && datum.iso) out.push([x, y, datum.iso]);
+      // Over water (or off the globe entirely) if the surface itself is hit and
+      // no cap is in front of it.
+      rc.setFromCamera(new THREE.Vector2((x / W) * 2 - 1, -(y / H) * 2 + 1), globe.camera());
+      for (const h of rc.intersectObject(globe.scene(), true)) {
+        const t = typeOf(h.object);
+        if (t === "polygon") break;
+        if (t === "globe") {
+          ocean.push([x, y]);
+          break;
+        }
       }
     }
   }
-  return out;
+  return { land, ocean };
 }, STEP);
 
 const missed = [];
-let wrongCountry = 0;
-for (const [x, y, iso] of samples) {
-  await page.mouse.move(x, y);
-  await page.waitForTimeout(120);
-  const hovered = await page.evaluate(() => {
+const mismatched = [];
+const readHover = () =>
+  page.evaluate(() => {
     const p = document.querySelector("header p");
     const m = p && /^([A-Z]{2})/.exec(p.textContent ?? "");
     return m ? m[1] : "";
   });
-  if (!hovered) missed.push([x, y, iso]);
-  else if (hovered !== iso) wrongCountry++;
+
+for (const [x, y] of land) {
+  await page.mouse.move(x, y);
+  await page.waitForTimeout(120);
+  const hovered = await readHover();
+  if (!hovered) {
+    // Re-measure now. If the scene no longer has a cap here, the sample list
+    // was stale (something moved the camera) and this is not an app miss.
+    const still = await expectedAt(x, y);
+    missed.push(still ? [x, y, still] : [x, y]);
+    continue;
+  }
+  const expected = await expectedAt(x, y);
+  if (expected && hovered !== expected) mismatched.push([x, y, hovered, expected]);
+}
+
+// Ocean must stay silent. Any ISO here is a country on the hidden hemisphere.
+const ghost = [];
+for (const [x, y] of ocean) {
+  await page.mouse.move(x, y);
+  await page.waitForTimeout(70);
+  const hovered = await readHover();
+  if (hovered) ghost.push([x, y, hovered]);
 }
 
 // Draw calls: the other half of the regression. The old single-map globe spent
@@ -104,15 +202,27 @@ const perf = await page.evaluate(
     })
 );
 
-const rate = samples.length ? (samples.length - missed.length) / samples.length : 0;
-const wrongRate = samples.length ? wrongCountry / samples.length : 1;
+const rate = land.length ? (land.length - missed.length) / land.length : 0;
+const wrongRate = land.length ? mismatched.length / land.length : 1;
 const ok =
-  samples.length > 100 && rate >= MIN_RATE && wrongRate <= MAX_WRONG && perf.calls < 1200;
+  land.length > 100 &&
+  ocean.length > 100 &&
+  rate >= MIN_RATE &&
+  wrongRate <= MAX_WRONG &&
+  ghost.length === 0 &&
+  perf.calls < 1200;
 
-console.log(`land pixels sampled : ${samples.length}`);
+console.log(`land pixels sampled : ${land.length}`);
 console.log(`hover hit rate      : ${(rate * 100).toFixed(1)}% (need >= ${MIN_RATE * 100}%)`);
-console.log(`neighbour pick      : ${wrongCountry} (${(wrongRate * 100).toFixed(1)}%, allow <= ${MAX_WRONG * 100}%)`);
-console.log(`missed samples      : ${missed.slice(0, 8).map((m) => m.join("@")).join(" ") || "none"}`);
+console.log(`mismatched country  : ${mismatched.length} (${(wrongRate * 100).toFixed(1)}%, allow <= ${MAX_WRONG * 100}%)`);
+console.log(
+  `missed samples      : ${missed.slice(0, 8).map((m) => (m[2] ? `${m[0]}@${m[1]}(wants ${m[2]})` : m.join("@"))).join(" ") || "none"}`
+);
+console.log(`mismatch detail     : ${mismatched.slice(0, 8).map((m) => `${m[0]},${m[1]} app=${m[2]} scene=${m[3]}`).join(" | ") || "none"}`);
+console.log(`ocean pixels sampled: ${ocean.length}`);
+console.log(
+  `far-side picks      : ${ghost.length} (need 0) ${ghost.slice(0, 6).map((g) => `${g[0]},${g[1]}=${g[2]}`).join(" ") || ""}`
+);
 console.log(`draw calls / frame  : ${perf.calls} (need < 1200)`);
 console.log(`fps                 : ${perf.fps}`);
 

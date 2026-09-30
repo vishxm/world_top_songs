@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router";
 import GlobeView, { type StageCountry } from "~/components/GlobeView";
 import ChartPanel, { type ChartKind } from "~/components/ChartPanel";
+import type { ChartTrack } from "~/lib/analyticsCharts";
 import Header from "~/components/Header";
 import RegionRail from "~/components/RegionRail";
 import NowPlaying from "~/components/NowPlaying";
@@ -160,11 +161,13 @@ useEffect(() => {
     [setParams]
   );
 
+  // Switching country must NOT stop the music. The queue is deliberately held
+  // outside the chart panel: playback state belongs to the session, not to
+  // whichever country's list happens to be on screen.
   const select = useCallback(
     (c: StageCountry) => {
       setStoredIso(c.iso);
       patchParams({ c: c.iso });
-      setActiveIndex(null);
     },
     [patchParams, setStoredIso]
   );
@@ -173,7 +176,6 @@ useEffect(() => {
 
   const closePanel = useCallback(() => {
     patchParams({ c: null });
-    setActiveIndex(null);
   }, [patchParams]);
 
   // First visit with no `?c`: land somewhere with a live chart rather than an
@@ -216,18 +218,33 @@ useEffect(() => {
 
   const [isPlaying, setIsPlaying] = useState(false);
 
-  const playNext = useCallback(() => {
-    setActiveIndex((i) => (i == null ? i : i + 1));
-  }, []);
+  // The queue is a snapshot of whatever list the user pressed play in. It
+  // survives country and tab changes so audio is never interrupted by navigation.
+  const [queue, setQueue] = useState<ChartTrack[]>([]);
 
   const { data, loading, error, retry } = useChart(selectedIso, kind);
 
-  // Auto-advance must wrap within the track list it was started from.
+  const playFromChart = useCallback((tracks: ChartTrack[], index: number) => {
+    setQueue(tracks);
+    setActiveIndex(index);
+  }, []);
+
+  /** The video currently playing, identified by id rather than index — the
+   *  queue outlives the chart panel, so an index would point at a different
+   *  track the moment you switch country. */
+  const activeVideoId = activeIndex != null ? (queue[activeIndex]?.videoId ?? null) : null;
+  const playerActive = queue.length > 0 && activeIndex != null;
+
+  const playNext = useCallback(() => {
+    setActiveIndex((i) => (i == null || queue.length === 0 ? i : (i + 1) % queue.length));
+  }, [queue.length]);
+
+  // Guard against a queue that shrank under us (e.g. a stale track list).
   useEffect(() => {
-    if (activeIndex != null && data && activeIndex >= data.tracks.length) {
+    if (activeIndex != null && queue.length > 0 && activeIndex >= queue.length) {
       setActiveIndex(0);
     }
-  }, [activeIndex, data]);
+  }, [activeIndex, queue.length]);
 
   // Stage geometry: push the globe into the space the panel leaves free so it
   // always sits in the optical centre of what the user can actually see.
@@ -321,38 +338,49 @@ useEffect(() => {
         </div>
       ) : null}
 
-      {/* Chart + player: a right rail on desktop, a bottom sheet on small screens. */}
-      {selected ? (
+      {/* Chart + player share one column so they can never overlap: the chart
+          takes the flexible space and the player keeps its natural height at the
+          bottom. The player is NOT gated on `data` — that tore the audio down on
+          every country switch — only on the queue, which outlives the chart. The
+          rail also stays mounted with no country selected so closing the panel
+          does not take the transport controls with it. */}
+      {selected || playerActive ? (
         <aside
-          className="fixed right-3 bottom-3 left-3 z-30 flex h-[48vh] flex-col gap-2.5 sm:right-5 sm:bottom-5 sm:left-auto sm:h-[calc(100vh-2.5rem)] sm:w-[384px]"
+          className={`fixed right-3 bottom-3 left-3 z-30 flex flex-col gap-2.5 sm:right-5 sm:bottom-5 sm:left-auto sm:w-[384px] ${
+            selected ? "h-[48vh] sm:h-[calc(100vh-2.5rem)]" : ""
+          }`}
           aria-label="Chart and player"
         >
-          <div className="min-h-0 flex-1">
-            <ChartPanel
-              iso={selected.iso}
-              name={selected.name}
-              region={selected.region}
-              data={data}
-              loading={loading}
-              error={error}
-              kind={kind}
-              activeIndex={activeIndex}
-              isPlaying={isPlaying}
-              isPaused={activeIndex != null && !isPlaying}
-              onTab={changeTab}
-              onPlay={setActiveIndex}
-              onRetry={retry}
-              onClose={closePanel}
-            />
-          </div>
-          {data && data.tracks.length > 0 ? (
-            <NowPlaying
-              tracks={data.tracks}
-              activeIndex={activeIndex}
-              onSelect={setActiveIndex}
-              onEnded={playNext}
-              onPlayingChange={setIsPlaying}
-            />
+          {selected ? (
+            <div className="min-h-0 flex-1">
+              <ChartPanel
+                iso={selected.iso}
+                name={selected.name}
+                region={selected.region}
+                data={data}
+                loading={loading}
+                error={error}
+                kind={kind}
+                activeVideoId={activeVideoId}
+                isPlaying={isPlaying}
+                isPaused={activeVideoId != null && !isPlaying}
+                onTab={changeTab}
+                onPlay={(i) => playFromChart(data?.tracks ?? [], i)}
+                onRetry={retry}
+                onClose={closePanel}
+              />
+            </div>
+          ) : null}
+          {playerActive ? (
+            <div className="shrink-0">
+              <NowPlaying
+                tracks={queue}
+                activeIndex={activeIndex}
+                onSelect={setActiveIndex}
+                onEnded={playNext}
+                onPlayingChange={setIsPlaying}
+              />
+            </div>
           ) : null}
         </aside>
       ) : null}

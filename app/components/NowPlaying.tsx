@@ -83,6 +83,8 @@ function loadApi(): Promise<void> {
   return apiPromise;
 }
 
+const DEFAULT_VOLUME = 100;
+
 const PATHS = {
   play: "M8 5.14v13.72a1 1 0 0 0 1.52.85l11.14-6.86a1 1 0 0 0 0-1.7L9.52 4.29A1 1 0 0 0 8 5.14Z",
   pause: "M7 4h3.5v16H7zM13.5 4H17v16h-3.5z",
@@ -115,7 +117,10 @@ export default function NowPlaying({ tracks, activeIndex, onSelect, onEnded, onP
   const [playing, setPlaying] = useState(false);
   const [buffering, setBuffering] = useState(false);
   const [muted, setMuted] = useState(false);
-  const [volume, setVolume] = useState(0.8);
+  /** 0–100, the IFrame API's own scale. Keeping anything else here silently
+   *  plays at a fraction of the intended volume — `setVolume(0.8)` is 0.8%, not
+   *  80%, which is why the player used to sound like a whisper. */
+  const [volume, setVolume] = useState(DEFAULT_VOLUME);
   const [videoOpen, setVideoOpen] = useState(false);
   /** Set when the browser refuses to autoplay; we then wait for a real click. */
   const [needsGesture, setNeedsGesture] = useState(false);
@@ -136,6 +141,38 @@ export default function NowPlaying({ tracks, activeIndex, onSelect, onEnded, onP
   const active = activeIndex != null ? tracks[activeIndex] : null;
   const activeId = active?.videoId;
 
+  // The user's intent, mirrored into refs so the callbacks below can read it
+  // without being re-created — re-creating them would tear the player down.
+  const mutedRef = useRef(muted);
+  mutedRef.current = muted;
+  const volumeRef = useRef(volume);
+  volumeRef.current = volume;
+
+  /**
+   * Re-assert the audio state the UI is showing, onto the player.
+   *
+   * This cannot be a one-shot. Chrome and Safari block audible autoplay, and
+   * YouTube's response is to start the video *muted and stay there* — which is
+   * exactly the "why is it silent" report. The IFrame API has no volume or mute
+   * playerVars, so the only cure is to push the state again every time the
+   * player reports something. Writes are guarded, so this is a no-op once the
+   * browser agrees.
+   */
+  const syncAudio = useCallback((p?: YTPlayer | null) => {
+    const player = p ?? playerRef.current;
+    if (!player) return;
+    try {
+      if (mutedRef.current) {
+        player.mute();
+        return;
+      }
+      if (player.isMuted()) player.unMute();
+      if (player.getVolume() !== volumeRef.current) player.setVolume(volumeRef.current);
+    } catch {
+      /* not ready */
+    }
+  }, []);
+
   const fitPlayer = useCallback(() => {
     const p = playerRef.current;
     const w = wrapRef.current;
@@ -154,9 +191,15 @@ export default function NowPlaying({ tracks, activeIndex, onSelect, onEnded, onP
     };
   }, []);
 
-  // Create the player on a FRESH container each time: the YT constructor
-  // replaces its target node with an iframe, so reusing a node across
-  // (StrictMode double-)mounts leaves a detached node and a broken player.
+  /**
+   * Create the player on a FRESH container each time: the YT constructor
+   * replaces its target node with an iframe, so reusing a node across
+   * (StrictMode double-)mounts leaves a detached node and a broken player.
+   *
+   * The key point is that this effect keys on `activeId` alone — not on the
+   * track list. The player is a sibling of the chart panel, so switching country
+   * leaves this component mounted and the audio untouched.
+   */
   useEffect(() => {
     if (!apiReady || !activeId || !wrapRef.current) return;
     const el = document.createElement("div");
@@ -166,16 +209,17 @@ export default function NowPlaying({ tracks, activeIndex, onSelect, onEnded, onP
     setNeedsGesture(false);
     const player = new window.YT!.Player(el, {
       videoId: activeId,
-      playerVars: { rel: 0, modestbranding: 1, autoplay: 1, playsinline: 1, iv_load_policy: 3 },
+      playerVars: {
+        rel: 0,
+        modestbranding: 1,
+        autoplay: 1,
+        playsinline: 1,
+        iv_load_policy: 3,
+      },
       events: {
         onReady: () => {
           fitPlayer();
-          try {
-            player.setVolume(volume);
-            if (muted) player.mute();
-          } catch {
-            /* not ready */
-          }
+          syncAudio(player);
         },
         onStateChange: (e) => {
           if (e.data === ENDED) {
@@ -184,7 +228,15 @@ export default function NowPlaying({ tracks, activeIndex, onSelect, onEnded, onP
           } else if (e.data === PLAYING) {
             setPlaying(true);
             setBuffering(false);
-            setNeedsGesture(false);
+            syncAudio(player);
+            // If the autoplay policy held the mute anyway, say so rather than
+            // showing an unmuted speaker over silent audio — the button becomes
+            // the gesture that unlocks sound.
+            try {
+              setNeedsGesture(!mutedRef.current && player.isMuted());
+            } catch {
+              setNeedsGesture(false);
+            }
           } else if (e.data === PAUSED) {
             setPlaying(false);
           } else if (e.data === BUFFERING) {
@@ -253,12 +305,15 @@ export default function NowPlaying({ tracks, activeIndex, onSelect, onEnded, onP
     if (!p || typeof p.playVideo !== "function") return;
     if (needsGesture) {
       setNeedsGesture(false);
+      // Inside a real gesture, un-muting sticks. This is the click that turns
+      // the volume on.
+      syncAudio();
       p.playVideo();
       return;
     }
     if (playing) p.pauseVideo();
     else p.playVideo();
-  }, [playing, needsGesture]);
+  }, [playing, needsGesture, syncAudio]);
 
   const step = useCallback(
     (dir: 1 | -1) => {
@@ -274,35 +329,24 @@ export default function NowPlaying({ tracks, activeIndex, onSelect, onEnded, onP
     if (p && dur > 0 && typeof p.seekTo === "function") p.seekTo(frac * dur, true);
   }, []);
 
-  const changeVolume = useCallback((v: number) => {
-    setVolume(v);
-    setMuted(v === 0);
-    const p = playerRef.current;
-    if (!p) return;
-    try {
-      p.setVolume(v);
-      if (v > 0 && p.isMuted()) p.unMute();
-      if (v === 0) p.mute();
-    } catch {
-      /* not ready */
-    }
-  }, []);
+  const changeVolume = useCallback(
+    (v: number) => {
+      volumeRef.current = v;
+      setVolume(v);
+      mutedRef.current = v === 0;
+      setMuted(v === 0);
+      syncAudio();
+    },
+    [syncAudio]
+  );
 
   const toggleMute = useCallback(() => {
-    const next = !muted;
+    const next = !mutedRef.current;
+    mutedRef.current = next;
     setMuted(next);
-    const p = playerRef.current;
-    if (!p) return;
-    try {
-      if (next) p.mute();
-      else {
-        p.unMute();
-        p.setVolume(volume || 0.8);
-      }
-    } catch {
-      /* not ready */
-    }
-  }, [muted, volume]);
+    setNeedsGesture(false);
+    syncAudio();
+  }, [syncAudio]);
 
   if (!active) return null;
 
@@ -422,8 +466,8 @@ export default function NowPlaying({ tracks, activeIndex, onSelect, onEnded, onP
               type="range"
               min={0}
               max={100}
-              value={Math.round((muted ? 0 : volume) * 100)}
-              onChange={(e) => changeVolume(Number(e.target.value) / 100)}
+              value={muted ? 0 : Math.round(volume)}
+              onChange={(e) => changeVolume(Number(e.target.value))}
               aria-label="Volume"
               className="h-1 w-0 cursor-pointer appearance-none rounded-full bg-raised opacity-0 transition-all duration-300 group-hover/vol:w-16 group-hover/vol:opacity-100 focus:w-16 focus:opacity-100 [&::-moz-range-thumb]:h-3 [&::-moz-range-thumb]:w-3 [&::-moz-range-thumb]:rounded-full [&::-moz-range-thumb]:border-0 [&::-moz-range-thumb]:bg-accent [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-accent"
             />

@@ -30,12 +30,20 @@
   /* Canvas colours. three-globe needs concrete colour strings, not color-mix(),
      so the globe palette lives here as its own set and re-skins per theme. The
      caps stay translucent on purpose: the night-earth texture underneath is the
-     thing that makes the globe look like a globe. */
-  --globe-cap: rgba(125, 154, 196, 0.14);
-  --globe-cap-dim: rgba(125, 154, 196, 0.04);
-  --globe-cap-hover: rgba(255, 208, 138, 0.38);
-  --globe-cap-selected: rgba(255, 208, 138, 0.5);
-  --globe-border: #7d9ac4;
+     thing that makes the globe look like a globe.
+
+     Two rules hold in every theme, because the same night texture is used by
+     all of them:
+       - borders must be LIGHT, or they vanish into the dark limb;
+       - hover must read as a different colour from selection, not just a
+         different opacity, since hover no longer lifts the cap. */
+  --globe-cap: rgba(150, 180, 222, 0.16);
+  --globe-cap-dim: rgba(125, 154, 196, 0.03);
+  --globe-cap-hover: rgba(190, 214, 245, 0.34);
+  --globe-cap-selected: rgba(255, 205, 120, 0.6);
+  /* Border is the only thing separating adjacent countries on a night-side
+     globe, so it needs to be bright enough to read as a line, not a hint. */
+  --globe-border: #a8c4e8;
   --globe-atmosphere: #f5a524;
 
   --font-sans: "Inter Variable", ui-sans-serif, system-ui, -apple-system, sans-serif;
@@ -109,9 +117,11 @@
 [data-theme="analog"] {
   --globe-cap: rgba(212, 85, 47, 0.16);
   --globe-cap-dim: rgba(212, 85, 47, 0.04);
-  --globe-cap-hover: rgba(240, 160, 119, 0.4);
-  --globe-cap-selected: rgba(240, 160, 119, 0.52);
-  --globe-border: #c98f6d;
+  /* Pale paper-warm for hover, saturated oxblood for the selection: the two
+     must not be the same hue at different alphas. */
+  --globe-cap-hover: rgba(248, 219, 191, 0.36);
+  --globe-cap-selected: rgba(212, 85, 47, 0.62);
+  --globe-border: #e3ab84;
   --globe-atmosphere: #d4552f;
   --color-void: #12100d;
   --color-panel: #1c1813;
@@ -130,11 +140,14 @@
 
 /* Bright cartographic: daylight paper, navy landmasses. */
 [data-theme="daylight"] {
-  --globe-cap: rgba(28, 78, 216, 0.1);
-  --globe-cap-dim: rgba(28, 78, 216, 0.03);
-  --globe-cap-hover: rgba(28, 78, 216, 0.3);
-  --globe-cap-selected: rgba(28, 78, 216, 0.4);
-  --globe-border: #93a7c4;
+  --globe-cap: rgba(120, 150, 210, 0.14);
+  --globe-cap-dim: rgba(120, 150, 210, 0.03);
+  /* Pale slate for hover against saturated navy for the selection — the paper
+     UI is light but the globe is still the night texture, so the caps have to
+     sit light-on-dark too. */
+  --globe-cap-hover: rgba(196, 214, 244, 0.38);
+  --globe-cap-selected: rgba(28, 78, 216, 0.6);
+  --globe-border: #c6d4ea;
   --globe-atmosphere: #1c4ed8;
   --color-void: #eef1f5;
   --color-panel: #ffffff;
@@ -156,9 +169,11 @@
 [data-theme="observatory"] {
   --globe-cap: rgba(34, 211, 238, 0.13);
   --globe-cap-dim: rgba(34, 211, 238, 0.03);
-  --globe-cap-hover: rgba(165, 240, 251, 0.34);
-  --globe-cap-selected: rgba(165, 240, 251, 0.46);
-  --globe-border: #2b5675;
+  --globe-cap-hover: rgba(190, 238, 250, 0.34);
+  --globe-cap-selected: rgba(34, 211, 238, 0.52);
+  /* The limb here is almost black, so the border has to be a genuinely bright
+     cyan to register as a line at all. */
+  --globe-border: #6fbad4;
   --globe-atmosphere: #22d3ee;
   --color-void: #01030a;
   --color-panel: #050b18;
