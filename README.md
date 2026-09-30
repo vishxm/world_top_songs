@@ -43,11 +43,38 @@ Open http://localhost:5173 (React Router prints the URL; port differs from Next.
 ## Checks
 
 ```bash
-npm run typecheck  # react-router typegen + tsc
+npm run typecheck     # react-router typegen + tsc
 npm run build
+npm run check:map     # map layers: coverage, winding, no invented geometry, draw-call budget
+npm run check:globe   # hover regression + draw calls (needs a dev server running)
 node --experimental-strip-types --no-warnings scripts/diff-check.mjs  # charts differ per country
 node scripts/build-world-map.mjs                                       # regenerates the map, then:
-node scripts/simplify-map.mjs && node scripts/map-check.mjs && node scripts/tri-check.mjs
+node scripts/simplify-map.mjs && npm run check:map
+```
+
+`npm run check:globe` is the gate for the country selector. It raycasts the globe
+itself, then hovers every pixel it finds on a country cap and asserts the app
+reports the same country. Run it after touching `GlobeView.tsx`, the map layers,
+or anything that changes polygon altitudes.
+
+## Map data
+
+Three generated files, one pipeline. Never hand-edit any of them.
+
+- `public/world-50m.geojson` — source of truth. Natural Earth 50m with the Kashmir
+  dispute patched per the Survey-of-India claim.
+- `public/world-50m-simple.geojson` — the render input (61% fewer vertices).
+- `public/country-caps.geojson` + `public/country-borders.geojson` — the two
+  layers the globe actually draws. Caps carry interaction and fills and are pruned
+  to the parts carrying each country's visual mass; borders keep every 50m ring
+  merged into a single object.
+
+Splitting them is what makes the globe usable. As one map, three-globe built a
+Mesh + LineSegments pair for each of ~1650 polygon parts — about **8200 draw calls
+per frame and 18fps**. Two layers is ~540 draw calls, and it stays smooth.
+
+```bash
+npm run map:layers   # regenerate caps + borders + app/lib/countryMeta.ts
 ```
 
 ## Deploy (Vercel)

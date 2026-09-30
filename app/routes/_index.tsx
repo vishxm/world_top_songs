@@ -1,215 +1,393 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import GlobeView, { GEOJSON_URL, featureToCountry, type CountryFeature } from "~/components/GlobeView";
-import Top10Panel, { type ChartData, type ChartKind } from "~/components/Top10Panel";
-import SearchBar from "~/components/SearchBar";
-import { CHART_COUNTRIES, flagEmoji } from "~/lib/countries";
+import { useSearchParams } from "react-router";
+import GlobeView, { type StageCountry } from "~/components/GlobeView";
+import ChartPanel, { type ChartKind } from "~/components/ChartPanel";
+import Header from "~/components/Header";
+import RegionRail from "~/components/RegionRail";
+import NowPlaying from "~/components/NowPlaying";
+import { CountryMark, EmptyState } from "~/components/ui";
+import { AlertTriangle, Compass } from "lucide-react";
+import { CHART_ISOS } from "~/lib/countries";
+import { loadBorderGeometry, loadCountryCaps } from "~/lib/mapData";
+import { useChart } from "~/hooks/useChart";
+import { useReducedMotion, useStoredState } from "~/hooks/usePrefs";
+import { useTheme, useThemeTokens } from "~/hooks/useTheme";
+import type { Region } from "~/lib/countryMeta";
+
+const PANEL_WIDTH = 384;
+const GUTTER = 48;
+/** Viewport fraction the bottom sheet occupies on narrow screens. Must match the
+ *  `h-[48vh]` on the sheet below, since both the globe offset and the chrome
+ *  positions above it are derived from it. */
+const SHEET_FRACTION = 0.48;
+/** Vertical space the header occupies on narrow screens; the globe centres in
+ *  what is left. Matches Header.tsx's two-row mobile layout. */
+const HEADER_CLEARANCE = 118;
+const FOV_TAN = Math.tan((50 / 2) * (Math.PI / 180)); // three-globe's fixed 50° fov
+
+/**
+ * Camera altitude (1 + distance/radius) that makes the globe fill `targetRadius`
+ * pixels. Solved from the projection rather than hand-tuned, so it stays correct
+ * at any viewport size.
+ */
+function altitudeForRadius(viewportH: number, targetRadius: number): number {
+  return viewportH / 2 / (targetRadius * FOV_TAN) - 1;
+}
+
+/**
+ * Wide layouts frame an individual country, so the altitude follows the country's
+ * angular size — but the globe's *near* edge must stay clear of the right rail,
+ * since that is where the selected country ends up. Fitting the near limb inside
+ * the stage is what stops the focus from hiding under the panel.
+ *
+ * Narrow layouts cannot zoom in at all: the globe shares the screen with the
+ * sheet and header, so it gets one fixed radius that fills the clear band, and
+ * the selected country is found by spinning rather than by framing.
+ */
+function altitudeForViewport(span: number, width: number, viewportH: number): number {
+  if (width < 1024) {
+    // Fit the clear band above the sheet, not the whole screen: the globe should
+    // read as a full disc in the space the user can actually see.
+    const clearBand = viewportH * (1 - SHEET_FRACTION) - HEADER_CLEARANCE;
+    const target = Math.min(width * 0.47, clearBand * 0.5);
+    return Math.max(2.4, altitudeForRadius(viewportH, target));
+  }
+  const stageWidth = width - (PANEL_WIDTH + GUTTER);
+  // Zoom out far enough that the whole sphere stays inside the stage, then zoom
+  // back in as far as the country's own size allows — so a city-state fills the
+  // stage while Russia still fits, instead of one fixed compromise for both.
+  const fitRadius = Math.min(stageWidth * 0.6, viewportH * 0.46);
+  const minRadius = Math.min(stageWidth * 0.2, viewportH * 0.14);
+  const maxRadius = Math.min(stageWidth * 0.62, viewportH * 0.46);
+  // Radius that would frame the country, then clamp it into the stage.
+  const wanted = ((span / 2.2) * FOV_TAN * viewportH) / 2;
+  return altitudeForRadius(viewportH, Math.min(fitRadius, Math.max(minRadius, Math.min(maxRadius, wanted))));
+}
 
 export default function Home() {
-  const [features, setFeatures] = useState<CountryFeature[]>([]);
-  const [geoError, setGeoError] = useState<string | null>(null);
-  const [selected, setSelected] = useState<CountryFeature | null>(null);
-  const [hovered, setHovered] = useState<CountryFeature | null>(null);
-  const [focus, setFocus] = useState<{ lat: number; lng: number; n: number } | null>(null);
-  const [data, setData] = useState<ChartData | null>(null);
-  const [kind, setKind] = useState<ChartKind>("songs");
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [activeIndex, setActiveIndex] = useState<number | null>(null);
-  const abortRef = useRef<AbortController | null>(null);
+  const [params, setParams] = useSearchParams();
+  const reducedMotion = useReducedMotion();
+  const { theme, setTheme } = useTheme();
+  const tokens = useThemeTokens(theme);
+  const [storedIso, setStoredIso] = useStoredState("wts.country", "US");
 
+  // Measure once per layout change rather than tracking every scroll/resize:
+  // the only numbers we need are the breakpoint, a coarse viewport width, and
+  // the height (the narrow-screen globe offset depends on it).
+  const viewportRef = useRef({ w: 1440, h: 900, isWide: true });
+
+  const [countries, setCountries] = useState<StageCountry[]>([]);
+  const [borders, setBorders] = useState<[number, number][][]>([]);
+  const [mapError, setMapError] = useState<string | null>(null);
+  const [mapLoading, setMapLoading] = useState(true);
+
+  const [hovered, setHovered] = useState<StageCountry | null>(null);
+  const [regionFilter, setRegionFilter] = useState<Region | null>(null);
+  const [focus, setFocus] = useState<{ lat: number; lng: number; altitude: number; n: number } | null>(null);
+  const [activeIndex, setActiveIndex] = useState<number | null>(null);
+  const [viewportW, setViewportW] = useState(1440);
+  const [hintDone, setHintDone] = useStoredState("wts.hint", "");
+
+  // ------------------------------------------------------------ map loading
   useEffect(() => {
-    let cancelled = false;
-    fetch(GEOJSON_URL)
-      .then((r) => {
-        if (!r.ok) throw new Error(`geo http=${r.status}`);
-        return r.json();
+    const ctrl = new AbortController();
+    setMapLoading(true);
+    Promise.all([loadCountryCaps(ctrl.signal), loadBorderGeometry(ctrl.signal)])
+      .then(([caps, rings]) => {
+        setCountries(caps);
+        setBorders(rings);
+        setMapError(null);
       })
-      .then((geo: { features?: unknown[] }) => {
-        if (cancelled) return;
-        const list = (geo.features ?? [])
-          .map((f) => featureToCountry(f))
-          .filter((c): c is CountryFeature => c != null);
-        // De-dupe by ISO (keep first).
-        const seen = new Set<string>();
-        setFeatures(list.filter((c) => (seen.has(c.iso) ? false : (seen.add(c.iso), true))));
+      .catch((e: unknown) => {
+        if (ctrl.signal.aborted) return;
+        setMapError(e instanceof Error ? e.message : "Could not load the world map");
       })
-      .catch((e) => {
-        if (!cancelled) setGeoError(e instanceof Error ? e.message : "map failed to load");
+      .finally(() => {
+        if (!ctrl.signal.aborted) setMapLoading(false);
       });
-    return () => {
-      cancelled = true;
-    };
+    return () => ctrl.abort();
   }, []);
+
+  // Only the breakpoint and the width matter, so snap the width to 100px steps
+// and ignore height-only changes (mobile browser chrome) entirely.
+useEffect(() => {
+    let lastW = -1;
+    let lastH = -1;
+    const update = () => {
+      const w = Math.round(window.innerWidth / 100) * 100;
+      const h = window.innerHeight;
+      const isWide = window.innerWidth >= 1024;
+      // Height only matters on narrow layouts (mobile browser chrome changes it).
+      const hBucket = isWide ? 0 : Math.round(h / 40) * 40;
+      if (w === lastW && hBucket === lastH) return;
+      lastW = w;
+      lastH = hBucket;
+      setViewportW(w);
+      viewportRef.current = { w, h: hBucket || h, isWide };
+    };
+    update();
+    window.addEventListener("resize", update);
+    return () => window.removeEventListener("resize", update);
+  }, []);
+
+  // ---------------------------------------------------------------- routing
+  // The URL is the source of truth for selection, so a country is shareable and
+  // the back button steps through history.
+  const selectedIso = params.get("c");
+  const kind: ChartKind = params.get("kind") === "videos" ? "videos" : "songs";
 
   const byIso = useMemo(() => {
-    const m = new Map<string, CountryFeature>();
-    features.forEach((f) => {
-      if (!m.has(f.iso)) m.set(f.iso, f);
-    });
+    const m = new Map<string, StageCountry>();
+    for (const c of countries) if (!m.has(c.iso)) m.set(c.iso, c);
     return m;
-  }, [features]);
+  }, [countries]);
 
-  // Precise picker: every chart country, for taps too small for the globe.
-  const quickList = useMemo(
-    () =>
-      Object.keys(CHART_COUNTRIES)
-        .map((iso) => byIso.get(iso))
-        .filter((c): c is CountryFeature => c != null)
-        .sort((a, b) => a.name.localeCompare(b.name)),
-    [byIso]
+  const selected = selectedIso ? byIso.get(selectedIso) ?? null : null;
+
+  const patchParams = useCallback(
+    (next: { c?: string | null; kind?: ChartKind }) => {
+      setParams(
+        (prev) => {
+          const p = new URLSearchParams(prev);
+          if (next.c === null) p.delete("c");
+          else if (next.c !== undefined) p.set("c", next.c);
+          if (next.kind) p.set("kind", next.kind);
+          return p;
+        },
+        { replace: false }
+      );
+    },
+    [setParams]
   );
-
-  // Desktop: shift the globe left so the open panel never covers it.
-  const [wide, setWide] = useState(false);
-  useEffect(() => {
-    const mq = window.matchMedia("(min-width: 640px)");
-    const update = () => setWide(mq.matches);
-    update();
-    mq.addEventListener("change", update);
-    return () => mq.removeEventListener("change", update);
-  }, []);
-  const globeOffset: [number, number] = selected && wide ? [-150, 0] : [0, 0];
-
-  const loadCharts = useCallback((iso: string, k: ChartKind) => {
-    abortRef.current?.abort();
-    const ctrl = new AbortController();
-    abortRef.current = ctrl;
-    setLoading(true);
-    setError(null);
-    setData(null);
-    setActiveIndex(null);
-    fetch(`/api/charts?country=${iso}&type=${k}`, { signal: ctrl.signal })
-      .then((r) => {
-        if (!r.ok) throw new Error(`http=${r.status}`);
-        return r.json();
-      })
-      .then((j) => {
-        setData(j as ChartData);
-        setLoading(false);
-      })
-      .catch((e) => {
-        if (ctrl.signal.aborted) return;
-        setError(e instanceof Error ? e.message : "fetch failed");
-        setLoading(false);
-      });
-  }, []);
 
   const select = useCallback(
-    (c: CountryFeature) => {
-      setSelected(c);
-      setFocus({ lat: c.lat, lng: c.lng, n: Date.now() });
-      loadCharts(c.iso, kind);
+    (c: StageCountry) => {
+      setStoredIso(c.iso);
+      patchParams({ c: c.iso });
+      setActiveIndex(null);
     },
-    [loadCharts, kind]
+    [patchParams, setStoredIso]
   );
 
-  const changeTab = useCallback(
-    (k: ChartKind) => {
-      setKind(k);
-      if (selected) loadCharts(selected.iso, k);
-    },
-    [loadCharts, selected]
-  );
+  const changeTab = useCallback((k: ChartKind) => patchParams({ kind: k }), [patchParams]);
 
-  // Pre-select the US so first paint already shows a live Top 10.
-  const preselected = useRef(false);
+  const closePanel = useCallback(() => {
+    patchParams({ c: null });
+    setActiveIndex(null);
+  }, [patchParams]);
+
+  // First visit with no `?c`: land somewhere with a live chart rather than an
+  // empty stage. `replace` keeps this out of the history stack.
+  const bootstrapped = useRef(false);
   useEffect(() => {
-    if (!preselected.current && byIso.has("US")) {
-      preselected.current = true;
-      const us = byIso.get("US")!;
-      setSelected(us);
-      loadCharts("US", "songs");
-    }
-  }, [byIso, loadCharts]);
+    if (bootstrapped.current || countries.length === 0) return;
+    bootstrapped.current = true;
+    if (params.has("c")) return;
+    const iso = byIso.has(storedIso) ? storedIso : (CHART_ISOS.find((i) => byIso.has(i)) ?? "US");
+    setParams(new URLSearchParams({ c: iso, kind }), { replace: true });
+  }, [countries.length, byIso, storedIso, params, setParams, kind]);
+
+  // The camera follows the selection, whichever way it changed — globe click,
+  // palette, URL deep link, or the back button.
+  const focusedIso = useRef<string | null>(null);
+  useEffect(() => {
+    if (!selected) return;
+    if (focusedIso.current === selected.iso) return;
+    focusedIso.current = selected.iso;
+    setFocus({
+      lat: selected.lat,
+      lng: selected.lng,
+      altitude: altitudeForViewport(selected.span, viewportRef.current.w, viewportRef.current.h),
+      n: Date.now(),
+    });
+  }, [selected, viewportW]);
+
+  useEffect(() => {
+    if (!selectedIso) focusedIso.current = null;
+  }, [selectedIso]);
 
   const surprise = useCallback(() => {
-    const pool = Object.keys(CHART_COUNTRIES).filter((iso) => byIso.has(iso));
+    const pool = CHART_ISOS.filter((iso) => byIso.has(iso));
     if (pool.length === 0) return;
     const iso = pool[Math.floor(Math.random() * pool.length)];
-    select(byIso.get(iso)!);
+    const c = byIso.get(iso);
+    if (c) select(c);
   }, [byIso, select]);
 
-  const playNext = useCallback(() => {
-    setActiveIndex((i) => {
-      if (i == null || !data) return i;
-      return (i + 1) % data.tracks.length;
-    });
-  }, [data]);
+  const [isPlaying, setIsPlaying] = useState(false);
 
-  // Stable callbacks so the memoized panel/search skip hover-only renders.
-  const retryCharts = useCallback(() => {
-    if (selected) loadCharts(selected.iso, kind);
-  }, [loadCharts, selected, kind]);
-  const closePanel = useCallback(() => {
-    setSelected(null);
-    setData(null);
-    setActiveIndex(null);
+  const playNext = useCallback(() => {
+    setActiveIndex((i) => (i == null ? i : i + 1));
   }, []);
 
-  return (
-    <main className="fixed inset-0 overflow-hidden bg-black text-white">
-      {geoError ? (
-        <div className="flex h-full items-center justify-center p-8 text-center">
-          <p className="text-sm text-red-300">Map failed to load: {geoError}</p>
-        </div>
-      ) : (
-        <GlobeView
-          features={features}
-          selectedIso={selected?.iso ?? null}
-          hoverIso={hovered?.iso ?? null}
-          focus={focus}
-          offset={globeOffset}
-          onHover={setHovered}
-          onSelect={select}
-        />
-      )}
+  const { data, loading, error, retry } = useChart(selectedIso, kind);
 
-      {/* Header */}
-      <header className="pointer-events-none absolute inset-x-0 top-0 z-10 flex items-start justify-between gap-3 p-4">
-        <div className="pointer-events-auto">
-          <h1 className="text-xl font-black tracking-tight drop-shadow sm:text-2xl">
-            🌍 World Top Songs
-          </h1>
-          <p className="text-xs text-zinc-400 drop-shadow">
-            {hovered ? (
-              <>
-                {flagEmoji(hovered.iso)} {hovered.name} — click to hear its Top 10
-              </>
-            ) : (
-              "Spin the globe · click a country · hear its Top 10"
-            )}
+  // Auto-advance must wrap within the track list it was started from.
+  useEffect(() => {
+    if (activeIndex != null && data && activeIndex >= data.tracks.length) {
+      setActiveIndex(0);
+    }
+  }, [activeIndex, data]);
+
+  // Stage geometry: push the globe into the space the panel leaves free so it
+  // always sits in the optical centre of what the user can actually see.
+  // Wide: the panel is a right rail, so shift left by half its footprint.
+  // Narrow: the panel is a bottom sheet covering ~46vh, so shift up by half
+  // of that — the globe then reads in the clear band above it.
+  const isWide = viewportRef.current.isWide;
+  const offset: [number, number] = isWide
+    ? [-(PANEL_WIDTH + GUTTER) / 2, 0]
+    : [0, -(viewportRef.current.h * SHEET_FRACTION) / 2 + HEADER_CLEARANCE / 2];
+
+  const showHint = !hintDone && countries.length > 0 && !mapLoading;
+  const dismissHint = useCallback(() => setHintDone("1"), [setHintDone]);
+
+  if (mapError) {
+    return (
+      <main className="fixed inset-0 grid place-items-center bg-void px-6 text-ink">
+        <EmptyState
+          icon={<AlertTriangle className="h-5 w-5" />}
+          title="The map didn't load"
+          body={mapError}
+          action={
+            <button
+              type="button"
+              onClick={() => window.location.reload()}
+              className="rounded-full bg-accent px-4 py-1.5 text-[12px] font-semibold text-accent-ink"
+            >
+              Reload
+            </button>
+          }
+        />
+      </main>
+    );
+  }
+
+  return (
+    <main className="fixed inset-0 overflow-hidden bg-void text-ink">
+      <GlobeView
+        countries={countries}
+        borders={borders}
+        selectedIso={selectedIso}
+        hoverIso={hovered?.iso ?? null}
+        focus={focus}
+        offset={offset}
+        reducedMotion={reducedMotion}
+        regionFilter={regionFilter}
+        palette={tokens.globe}
+        onHover={setHovered}
+        onSelect={select}
+      />
+
+      {/* Vignette: pulls the eye to the globe and stops the star field from
+          fighting the panel text. Kept light — the globe is the subject. */}
+      <div
+        aria-hidden
+        className="pointer-events-none absolute inset-0 z-10 bg-[radial-gradient(115%_85%_at_38%_48%,transparent_45%,color-mix(in_oklab,var(--color-void)_82%,transparent)_100%)]"
+      />
+
+      <Header
+        countries={countries}
+        hovered={hovered}
+        selectedIso={selectedIso}
+        theme={theme}
+        onPick={select}
+        onSurprise={surprise}
+        onTheme={setTheme}
+      />
+
+      {/* Region rail. Sits in the flow between the stage and the sheet (or the
+          stage and the viewport bottom when no sheet is open), so it can never
+          overlap the globe or the panel at any viewport size. */}
+      <div
+        className={`pointer-events-none absolute inset-x-0 z-20 flex justify-center px-3 sm:inset-x-auto sm:left-5 sm:px-0 ${
+          selected ? "bottom-[calc(48vh+1.25rem)] sm:bottom-5" : "bottom-3 sm:bottom-5"
+        }`}
+      >
+        <RegionRail countries={countries} region={regionFilter} onRegion={setRegionFilter} />
+      </div>
+
+      {/* Hint. On narrow the rail already occupies the band above the sheet, so
+          the hint overlays the globe instead and fades with the vignette. */}
+      {showHint ? (
+        <div className="pointer-events-none absolute inset-x-0 bottom-[calc(48vh+4rem)] z-20 flex justify-center px-3 sm:inset-x-auto sm:bottom-20 sm:left-5 sm:justify-start sm:px-0">
+          <p
+            className="glass pointer-events-auto w-fit max-w-[min(34rem,100%)] rounded-xl px-3.5 py-2 text-[12px] text-muted motion-safe:animate-rise"
+            onClick={dismissHint}
+          >
+            Drag the globe to spin it. Click any country to load its weekly Top 10 — or press{" "}
+            <kbd className="rounded border border-line px-1">⌘K</kbd> to pick from all {countries.length}.
           </p>
         </div>
-        <div className="pointer-events-auto flex items-center gap-2">
-          <SearchBar countries={features} quickList={quickList} onPick={select} />
-          <button
-            onClick={surprise}
-            className="shrink-0 rounded-full bg-blue-500 px-4 py-2 text-sm font-semibold shadow-lg hover:bg-blue-400"
-          >
-            🎲 Surprise me
-          </button>
-        </div>
-      </header>
+      ) : null}
 
-      {/* Chart panel: side panel on desktop, bottom sheet on mobile */}
-      {selected && (
-        <div className="absolute inset-x-2 bottom-2 z-10 max-h-[52%] sm:inset-x-auto sm:bottom-4 sm:right-4 sm:top-24 sm:max-h-none sm:w-[380px]">
-          <Top10Panel
-            iso={selected.iso}
-            name={selected.name}
-            data={data}
-            loading={loading}
-            error={error}
-            kind={kind}
-            activeIndex={activeIndex}
-            onTab={changeTab}
-            onPlay={setActiveIndex}
-            onNext={playNext}
-            onRetry={retryCharts}
-            onClose={closePanel}
-          />
+      {/* Chart + player: a right rail on desktop, a bottom sheet on small screens. */}
+      {selected ? (
+        <aside
+          className="fixed right-3 bottom-3 left-3 z-30 flex h-[48vh] flex-col gap-2.5 sm:right-5 sm:bottom-5 sm:left-auto sm:h-[calc(100vh-2.5rem)] sm:w-[384px]"
+          aria-label="Chart and player"
+        >
+          <div className="min-h-0 flex-1">
+            <ChartPanel
+              iso={selected.iso}
+              name={selected.name}
+              region={selected.region}
+              data={data}
+              loading={loading}
+              error={error}
+              kind={kind}
+              activeIndex={activeIndex}
+              isPlaying={isPlaying}
+              isPaused={activeIndex != null && !isPlaying}
+              onTab={changeTab}
+              onPlay={setActiveIndex}
+              onRetry={retry}
+              onClose={closePanel}
+            />
+          </div>
+          {data && data.tracks.length > 0 ? (
+            <NowPlaying
+              tracks={data.tracks}
+              activeIndex={activeIndex}
+              onSelect={setActiveIndex}
+              onEnded={playNext}
+              onPlayingChange={setIsPlaying}
+            />
+          ) : null}
+        </aside>
+      ) : null}
+
+      {/* Screen-reader only: the globe is not navigable, so announce what a
+          keyboard user just selected. */}
+      <p className="sr-only" aria-live="polite">
+        {selected
+          ? `${selected.name} chart, ${kind === "songs" ? "top songs" : "top videos"}. ${loading ? "Loading." : data ? `${data.tracks.length} tracks.` : error ? `Error: ${error}` : ""}`
+          : ""}
+      </p>
+
+      {/* Idle / empty stage affordance, also the loading state. */}
+      {!selected && (mapLoading || countries.length === 0) ? (
+        <div className="pointer-events-none absolute inset-0 z-20 grid place-items-center">
+          <div className="flex flex-col items-center gap-3 text-center">
+            <span className="relative grid h-12 w-12 place-items-center">
+              <span className="absolute inset-0 animate-halo rounded-full border border-accent" />
+              <Compass className="h-5 w-5 text-accent" />
+            </span>
+            <p className="text-[12px] text-faint">Drawing the world…</p>
+          </div>
         </div>
-      )}
+      ) : null}
+
+      {!selected && countries.length > 0 && !mapLoading ? (
+        <div className="pointer-events-none absolute inset-x-0 top-1/2 left-1/2 z-20 hidden -translate-x-1/2 -translate-y-1/2 md:block">
+          <div className="glass flex items-center gap-3 rounded-panel px-4 py-3">
+            <Compass className="h-4 w-4 text-accent" />
+            <p className="text-[12.5px] text-muted">
+              Pick a country to hear its weekly Top 10
+            </p>
+          </div>
+        </div>
+      ) : null}
     </main>
   );
 }

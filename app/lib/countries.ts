@@ -1,7 +1,6 @@
-// Countries with a dedicated YouTube Music chart (from the live
-// FEmusic_charts country menu: 69 countries + Global). Any other
-// selection falls back to the Global chart.
-
+// Country chart coverage. This list is the source of truth for "which countries
+// have their own weekly chart" and is read by the server route, the globe build
+// script and the client picker — keep it in sync by running the build scripts.
 export const CHART_COUNTRIES: Record<string, string> = {
   AR: "Argentina",
   AU: "Australia",
@@ -77,10 +76,4 @@ export function isChartCountry(iso: string): boolean {
   return iso in CHART_COUNTRIES;
 }
 
-export function flagEmoji(iso: string): string {
-  if (!/^[A-Z]{2}$/.test(iso)) return "🌐";
-  const base = 0x1f1e6;
-  return String.fromCodePoint(
-    ...iso.split("").map((c) => base + c.charCodeAt(0) - 65)
-  );
-}
+export const CHART_ISOS: readonly string[] = Object.keys(CHART_COUNTRIES).sort();

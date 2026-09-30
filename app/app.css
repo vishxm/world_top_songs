@@ -1,7 +1,337 @@
 @import "tailwindcss";
 
-html,
-body {
-  background: #000;
-  color: #fff;
+/* Self-hosted so there is no runtime CDN dependency (the project ships
+   keyless and offline-capable). `full` pulls Fraunces' optical-size + SOFT +
+   WONK axes, which is where its character lives. */
+@import "@fontsource-variable/inter/wght.css";
+@import "@fontsource-variable/fraunces/full.css";
+
+/* ---------------------------------------------------------------------------
+   Tokens — default theme is "mission control": near-black cold stage, one warm
+   accent, editorial serif for names. The four palettes under [data-theme] below
+   override only these variables, so the whole app re-skins from one attribute.
+--------------------------------------------------------------------------- */
+@theme {
+  --color-void: #04060b;
+  --color-panel: #0a0e17;
+  --color-raised: #121a27;
+  --color-line: #1d2634;
+  --color-line-bright: #2f3d51;
+  --color-ink: #eef2f8;
+  --color-muted: #8d99ad;
+  --color-faint: #58637a;
+  --color-accent: #f5a524;
+  --color-accent-ink: #1a1204;
+  --color-accent-soft: #ffd08a;
+  --color-up: #4ade80;
+  --color-down: #fb7185;
+  --color-live: #38bdf8;
+
+  /* Canvas colours. three-globe needs concrete colour strings, not color-mix(),
+     so the globe palette lives here as its own set and re-skins per theme. The
+     caps stay translucent on purpose: the night-earth texture underneath is the
+     thing that makes the globe look like a globe. */
+  --globe-cap: rgba(125, 154, 196, 0.14);
+  --globe-cap-dim: rgba(125, 154, 196, 0.04);
+  --globe-cap-hover: rgba(255, 208, 138, 0.38);
+  --globe-cap-selected: rgba(255, 208, 138, 0.5);
+  --globe-border: #7d9ac4;
+  --globe-atmosphere: #f5a524;
+
+  --font-sans: "Inter Variable", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-display: "Fraunces Variable", ui-serif, Georgia, serif;
+
+  --radius-panel: 1.25rem;
+
+  --shadow-stage: 0 1px 0 0 rgb(255 255 255 / 0.04) inset, 0 24px 60px -20px rgb(0 0 0 / 0.85);
+  --shadow-lift: 0 18px 40px -18px rgb(0 0 0 / 0.9);
+
+  --ease-out-expo: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+
+  --animate-rise: rise 420ms var(--ease-out-expo) both;
+  --animate-fade: fade 260ms var(--ease-out-expo) both;
+  --animate-halo: halo 2.8s var(--ease-out-expo) infinite;
+  --animate-shimmer: shimmer 1.6s linear infinite;
+  --animate-bar: bar 900ms ease-in-out infinite;
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@keyframes fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes halo {
+  0% {
+    opacity: 0.55;
+    transform: scale(1);
+  }
+  70%,
+  100% {
+    opacity: 0;
+    transform: scale(2.6);
+  }
+}
+@keyframes shimmer {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(100%);
+  }
+}
+@keyframes bar {
+  0%,
+  100% {
+    transform: scaleY(0.28);
+  }
+  50% {
+    transform: scaleY(1);
+  }
+}
+
+/* --- alternative directions, switchable at runtime via <html data-theme> --- */
+
+/* Warm analog: paper, oxblood, ink. */
+[data-theme="analog"] {
+  --globe-cap: rgba(212, 85, 47, 0.16);
+  --globe-cap-dim: rgba(212, 85, 47, 0.04);
+  --globe-cap-hover: rgba(240, 160, 119, 0.4);
+  --globe-cap-selected: rgba(240, 160, 119, 0.52);
+  --globe-border: #c98f6d;
+  --globe-atmosphere: #d4552f;
+  --color-void: #12100d;
+  --color-panel: #1c1813;
+  --color-raised: #2a231b;
+  --color-line: #3a3026;
+  --color-line-bright: #55463a;
+  --color-ink: #f6efe3;
+  --color-muted: #b3a48c;
+  --color-faint: #7d7059;
+  --color-accent: #d4552f;
+  --color-accent-ink: #fdf3e8;
+  --color-accent-soft: #f0a077;
+  --color-up: #8fae63;
+  --color-down: #c4553f;
+}
+
+/* Bright cartographic: daylight paper, navy landmasses. */
+[data-theme="daylight"] {
+  --globe-cap: rgba(28, 78, 216, 0.1);
+  --globe-cap-dim: rgba(28, 78, 216, 0.03);
+  --globe-cap-hover: rgba(28, 78, 216, 0.3);
+  --globe-cap-selected: rgba(28, 78, 216, 0.4);
+  --globe-border: #93a7c4;
+  --globe-atmosphere: #1c4ed8;
+  --color-void: #eef1f5;
+  --color-panel: #ffffff;
+  --color-raised: #f4f6fa;
+  --color-line: #d8dee8;
+  --color-line-bright: #b4bfcf;
+  --color-ink: #101725;
+  --color-muted: #5c6a80;
+  --color-faint: #8b98ab;
+  --color-accent: #1c4ed8;
+  --color-accent-ink: #ffffff;
+  --color-accent-soft: #93b4ff;
+  --color-up: #15803d;
+  --color-down: #be123c;
+  --color-live: #0369a1;
+}
+
+/* Deep space observatory: colder, monospace-leaning, colder accent. */
+[data-theme="observatory"] {
+  --globe-cap: rgba(34, 211, 238, 0.13);
+  --globe-cap-dim: rgba(34, 211, 238, 0.03);
+  --globe-cap-hover: rgba(165, 240, 251, 0.34);
+  --globe-cap-selected: rgba(165, 240, 251, 0.46);
+  --globe-border: #2b5675;
+  --globe-atmosphere: #22d3ee;
+  --color-void: #01030a;
+  --color-panel: #050b18;
+  --color-raised: #0a1526;
+  --color-line: #142438;
+  --color-line-bright: #1f3c58;
+  --color-ink: #d6e6f7;
+  --color-muted: #7290ad;
+  --color-faint: #465f78;
+  --color-accent: #22d3ee;
+  --color-accent-ink: #001318;
+  --color-accent-soft: #a5f0fb;
+  --color-up: #34d399;
+  --color-down: #fb7185;
+}
+
+/* --------------------------------------------------------------------------- */
+
+@layer base {
+  * {
+    border-color: var(--color-line);
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  html {
+    color-scheme: dark;
+    background: var(--color-void);
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    margin: 0;
+    background: var(--color-void);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    font-feature-settings: "cv11", "ss01";
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    overscroll-behavior: none;
+  }
+
+  [data-theme="daylight"] body {
+    color-scheme: light;
+  }
+
+  ::selection {
+    background: color-mix(in oklab, var(--color-accent) 35%, transparent);
+    color: var(--color-ink);
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+
+  button,
+  input {
+    font: inherit;
+    color: inherit;
+  }
+
+  /* Slim, theme-aware scrollbars — the chart list is the main scroller. */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-line-bright) transparent;
+  }
+  *::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  *::-webkit-scrollbar-thumb {
+    background: var(--color-line-bright);
+    border: 3px solid transparent;
+    background-clip: content-box;
+    border-radius: 999px;
+  }
+  *::-webkit-scrollbar-thumb:hover {
+    background: var(--color-faint);
+    background-clip: content-box;
+  }
+  *::-webkit-scrollbar-track {
+    background: transparent;
+  }
+}
+
+@layer components {
+  /* Frosted panel used by the chart sheet, the palette and the dock. */
+  .glass {
+    background: color-mix(in oklab, var(--color-panel) 82%, transparent);
+    backdrop-filter: blur(28px) saturate(140%);
+    -webkit-backdrop-filter: blur(28px) saturate(140%);
+    border: 1px solid var(--color-line);
+    box-shadow: var(--shadow-stage);
+  }
+
+  .glass-raised {
+    background: color-mix(in oklab, var(--color-raised) 88%, transparent);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    border: 1px solid var(--color-line);
+  }
+
+  /* 1px top highlight that makes a dark panel read as a lit surface. */
+  .lit {
+    position: relative;
+  }
+  .lit::before {
+    content: "";
+    position: absolute;
+    inset: 0 0 auto;
+    height: 1px;
+    background: linear-gradient(
+      90deg,
+      transparent,
+      color-mix(in oklab, var(--color-ink) 16%, transparent) 22%,
+      color-mix(in oklab, var(--color-ink) 16%, transparent) 78%,
+      transparent
+    );
+    pointer-events: none;
+  }
+
+  .tnum {
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum";
+  }
+
+  /* Screen-reader-only, still focusable (used by the skip link). */
+  .sr-only-focusable:not(:focus):not(:focus-within) {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+}
+
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+  .text-pretty {
+    text-wrap: pretty;
+  }
+  /* Fraunces' signature: slightly softened, slightly wonky terminals. */
+  .display {
+    font-family: var(--font-display);
+    font-variation-settings: "SOFT" 24, "WONK" 1;
+    letter-spacing: -0.015em;
+  }
+  .no-scrollbar {
+    scrollbar-width: none;
+  }
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }
