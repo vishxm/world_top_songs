@@ -11,7 +11,8 @@
     "typecheck": "react-router typegen && tsc --noEmit",
     "map:layers": "node scripts/build-map-layers.mjs && node scripts/build-country-meta.mjs",
     "check:map": "node scripts/map-check.mjs public/world-50m-simple.geojson && node scripts/tri-check.mjs public/world-50m-simple.geojson && node scripts/map-layers-check.mjs",
-    "check:globe": "node scripts/globe-pick-check.mjs"
+    "check:pick": "node scripts/globe-pick-geometry.mjs",
+    "check:globe": "node scripts/globe-pick-geometry.mjs && node scripts/globe-pick-check.mjs"
   },
   "dependencies": {
     "@fontsource-variable/fraunces": "^5.3.0",

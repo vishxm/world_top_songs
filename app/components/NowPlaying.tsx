@@ -112,6 +112,9 @@ export default function NowPlaying({ tracks, activeIndex, onSelect, onEnded, onP
   const bufferedRef = useRef<HTMLSpanElement>(null);
   const timeRef = useRef<HTMLSpanElement>(null);
   const rangeRef = useRef<HTMLInputElement>(null);
+  /** Last position/duration handed to the OS scrubber, to throttle the call. */
+  const lastPositionRef = useRef<number | null>(null);
+  const lastDurRef = useRef<number | null>(null);
   const endedRef = useRef(onEnded);
   const [apiReady, setApiReady] = useState(false);
   const [playing, setPlaying] = useState(false);
@@ -130,13 +133,18 @@ export default function NowPlaying({ tracks, activeIndex, onSelect, onEnded, onP
   }, [onEnded]);
 
   // Lift playback state to the parent so the chart row can show its equalizer.
-  const playingRef = useRef(onPlayingChange);
+  const playingChangeRef = useRef(onPlayingChange);
   useEffect(() => {
-    playingRef.current = onPlayingChange;
+    playingChangeRef.current = onPlayingChange;
   }, [onPlayingChange]);
   useEffect(() => {
-    playingRef.current?.(playing);
+    playingChangeRef.current?.(playing);
   }, [playing]);
+
+  // The progress poll is installed per-track and closes over `activeId` only, so
+  // it needs its own mirror of `playing` rather than a stale capture.
+  const playingRef = useRef(playing);
+  playingRef.current = playing;
 
   const active = activeIndex != null ? tracks[activeIndex] : null;
   const activeId = active?.videoId;
@@ -291,6 +299,26 @@ export default function NowPlaying({ tracks, activeIndex, onSelect, onEnded, onP
         range.value = String(Math.round(frac * RANGE_MAX));
         range.setAttribute("aria-valuetext", dur > 0 ? `${fmtDuration(now)} of ${fmtDuration(dur)}` : fmtDuration(now));
       }
+      // Feed the OS scrubber, which is what draws progress in Control Centre and
+      // on the Touch Bar. Throttled to whole seconds: setPositionState on every
+      // tick is a cross-browser call that nothing samples finer than that.
+      const session = navigator.mediaSession;
+      if (session && dur > 0 && Number.isFinite(dur)) {
+        const last = lastPositionRef.current;
+        if (last === null || Math.abs(now - last) >= 1 || dur !== lastDurRef.current) {
+          lastPositionRef.current = now;
+          lastDurRef.current = dur;
+          try {
+            session.setPositionState({
+              duration: dur,
+              playbackRate: playingRef.current ? 1 : 0,
+              position: Math.min(Math.max(0, now), dur),
+            });
+          } catch {
+            // Throws for live or unknown durations; the in-app bar is unaffected.
+          }
+        }
+      }
     }, 120);
     return () => clearInterval(id);
   }, [activeId]);
@@ -328,6 +356,109 @@ export default function NowPlaying({ tracks, activeIndex, onSelect, onEnded, onP
     const dur = p?.getDuration?.() ?? 0;
     if (p && dur > 0 && typeof p.seekTo === "function") p.seekTo(frac * dur, true);
   }, []);
+
+  const seekBy = useCallback((delta: number) => {
+    const p = playerRef.current;
+    const dur = p?.getDuration?.() ?? 0;
+    if (!p || dur <= 0 || typeof p.seekTo !== "function") return;
+    // Clamp inside the track: the OS calls this "skip back 15s", so running off
+    // the front would be wrong — that is `previoustrack`'s job.
+    const next = Math.min(dur - 0.25, Math.max(0, (p.getCurrentTime?.() ?? 0) + delta));
+    p.seekTo(next, true);
+  }, []);
+
+  // ------------------------------------------------- macOS / keyboard transport
+  // The next/previous keys on a MacBook (F7/F9, or the Touch Bar and Control
+  // Centre transport) are media keys. Browsers do not deliver those as keydown
+  // events — they surface them as Media Session actions, and only if the page has
+  // installed handlers. Without this block the keys reached nothing at all, which
+  // is why they did not change the song: there was no subscription for them to
+  // arrive on.
+  //
+  // Handlers are registered once and read through a ref, because `toggle`/`step`
+  // change identity whenever their deps do, and re-registering on every track
+  // change would be churn for no benefit.
+  const transport = useRef<{
+    toggle: () => void;
+    step: (dir: 1 | -1) => void;
+    seekBy: (delta: number) => void;
+    seekTo: (seconds: number) => void;
+  }>({ toggle: () => {}, step: () => {}, seekBy: () => {}, seekTo: () => {} });
+  transport.current = {
+    toggle,
+    step,
+    seekBy,
+    seekTo: (seconds: number) => {
+      const p = playerRef.current;
+      const dur = p?.getDuration?.() ?? 0;
+      if (p && dur > 0 && typeof p.seekTo === "function") {
+        p.seekTo(Math.min(Math.max(0, seconds), dur), true);
+      }
+    },
+  };
+
+  useEffect(() => {
+    const session = navigator.mediaSession;
+    if (!session) return;
+    const bind = (
+      action: MediaSessionAction,
+      fn: (details: MediaSessionActionDetails) => void
+    ) => {
+      try {
+        session.setActionHandler(action, fn);
+      } catch {
+        // Not every action is supported everywhere; a missing one is not fatal.
+      }
+    };
+    bind("previoustrack", () => transport.current.step(-1));
+    bind("nexttrack", () => transport.current.step(1));
+    bind("play", () => transport.current.toggle());
+    bind("pause", () => transport.current.toggle());
+    bind("stop", () => transport.current.toggle());
+    bind("seekbackward", () => transport.current.seekBy(-10));
+    bind("seekforward", () => transport.current.seekBy(10));
+    bind("seekto", (details) => {
+      if (typeof details.seekTime === "number") transport.current.seekTo(details.seekTime);
+    });
+    return () => {
+      for (const action of [
+        "previoustrack",
+        "nexttrack",
+        "play",
+        "pause",
+        "stop",
+        "seekbackward",
+        "seekforward",
+        "seekto",
+      ] as MediaSessionAction[]) {
+        try {
+          session.setActionHandler(action, null);
+        } catch {
+          /* see above */
+        }
+      }
+    };
+  }, []);
+
+  // Now-playing metadata. Without it the OS has nothing to attach the transport
+  // keys to, and its own panel stays blank.
+  useEffect(() => {
+    const session = navigator.mediaSession;
+    if (!session) return;
+    session.metadata = active
+      ? new MediaMetadata({
+          title: active.title,
+          artist: active.artists,
+          artwork: active.thumbnail ? [{ src: active.thumbnail, sizes: "480x360" }] : [],
+        })
+      : null;
+  }, [activeId, active?.title, active?.artists, active?.thumbnail]);
+
+  useEffect(() => {
+    const session = navigator.mediaSession;
+    if (!session) return;
+    session.playbackState = playing ? "playing" : "paused";
+  }, [playing, activeId]);
 
   const changeVolume = useCallback(
     (v: number) => {
@@ -389,13 +520,23 @@ export default function NowPlaying({ tracks, activeIndex, onSelect, onEnded, onP
             while the visuals stay driven by direct DOM writes. */}
         <div className="relative -mx-1 h-4">
           <span className="pointer-events-none absolute inset-x-1 top-1/2 h-[3px] -translate-y-1/2 overflow-hidden rounded-full bg-raised">
+            {/* The starting scale is set inline, NOT with `scale-x-0`. Tailwind v4
+                compiles `scale-x-0` to the standalone `scale: 0 1` property, and a
+                later inline `transform: scaleX(0.15)` composes with that rather than
+                replacing it — so the bar collapsed to zero width and never drew at
+                all, while the time label, `aria-valuetext` and click-to-seek all kept
+                working. In v3 both wrote `transform`, so this only broke on the v4
+                upgrade. Driving the whole visual from the inline transform keeps it
+                independent of whatever the scale utilities do next. */}
             <span
               ref={bufferedRef}
-              className="absolute inset-0 origin-left scale-x-0 rounded-full bg-line-bright"
+              style={{ transform: "scaleX(0)" }}
+              className="absolute inset-0 origin-left rounded-full bg-line-bright"
             />
             <span
               ref={fillRef}
-              className="absolute inset-0 origin-left scale-x-0 rounded-full bg-accent"
+              style={{ transform: "scaleX(0)" }}
+              className="absolute inset-0 origin-left rounded-full bg-accent"
             />
           </span>
           <input

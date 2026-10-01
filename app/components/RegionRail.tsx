@@ -16,7 +16,16 @@ interface Props {
  *  The rail is labelled because an unlabelled row of country-ish chips reads as
  *  navigation and does nothing you can see. The label states the effect, the
  *  chips carry the counts, and the active chip is pressed so a screen reader
- *  announces the filter rather than just a highlighted pill. */
+ *  announces the filter rather than just a highlighted pill.
+ *
+ *  WRAPS rather than scrolls sideways. Seven chips plus the label are ~700px, so
+ *  on a phone an `overflow-x-auto` rail put four of them past the right edge
+ *  behind `no-scrollbar` — present in the DOM, unreachable by finger, and
+ *  indistinguishable from "the buttons don't work". `justify-center` made it
+ *  worse: it centres the overflowing content, which pushes the left-hand overflow
+ *  out of reach of `scrollLeft` too, so that end could not even be scrolled back.
+ *  Wrapping keeps every chip on screen and tappable; it grows upward, which is
+ *  free because the rail is anchored to the bottom. */
 export default function RegionRail({ countries, region, onRegion }: Props) {
   const counts = new Map<Region, number>();
   for (const c of countries) counts.set(c.region, (counts.get(c.region) ?? 0) + 1);
@@ -25,7 +34,7 @@ export default function RegionRail({ countries, region, onRegion }: Props) {
   return (
     <nav
       aria-label="Filter by region"
-      className="pointer-events-auto flex max-w-full items-center gap-1 overflow-x-auto no-scrollbar"
+      className="pointer-events-auto flex max-w-full flex-wrap items-center justify-center gap-1 sm:justify-start"
     >
       <span className="flex shrink-0 items-center gap-1.5 pr-1.5 text-[11.5px] font-medium tracking-[0.08em] text-faint uppercase">
         <Filter className="h-3.5 w-3.5" aria-hidden />

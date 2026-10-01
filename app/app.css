@@ -41,8 +41,12 @@
   /* Dimmed is a ghost, not a blackout. At 0.03 the filtered-out land vanished
      and the globe read as a broken render rather than as a filter. */
   --globe-cap-dim: rgba(125, 154, 196, 0.075);
-  --globe-cap-hover: rgba(190, 214, 245, 0.34);
-  --globe-cap-selected: rgba(255, 205, 120, 0.6);
+  --globe-cap-hover: rgba(205, 226, 252, 0.5);
+  /* Selection is a fill AND a traced edge (see OUTLINE_ALTITUDE). At 0.6 the
+     amber composited to rgb(156,129,82) over the night texture — 3.5:1 against
+     unselected land, which read as a milky wash rather than a selection. */
+  --globe-cap-selected: rgba(255, 214, 124, 0.93);
+  --globe-cap-outline: #ffe9b0;
   /* Border is the only thing separating adjacent countries on a night-side
      globe, so it needs to be bright enough to read as a line, not a hint. */
   --globe-border: #a8c4e8;
@@ -121,8 +125,9 @@
   --globe-cap-dim: rgba(212, 85, 47, 0.085);
   /* Pale paper-warm for hover, saturated oxblood for the selection: the two
      must not be the same hue at different alphas. */
-  --globe-cap-hover: rgba(248, 219, 191, 0.36);
-  --globe-cap-selected: rgba(212, 85, 47, 0.62);
+  --globe-cap-hover: rgba(255, 232, 212, 0.5);
+  --globe-cap-selected: rgba(255, 122, 72, 0.93);
+  --globe-cap-outline: #ffd8c2;
   --globe-border: #e3ab84;
   --globe-atmosphere: #d4552f;
   --color-void: #12100d;
@@ -147,8 +152,9 @@
   /* Pale slate for hover against saturated navy for the selection — the paper
      UI is light but the globe is still the night texture, so the caps have to
      sit light-on-dark too. */
-  --globe-cap-hover: rgba(196, 214, 244, 0.38);
-  --globe-cap-selected: rgba(28, 78, 216, 0.6);
+  --globe-cap-hover: rgba(214, 238, 252, 0.55);
+  --globe-cap-selected: rgba(45, 110, 245, 0.92);
+  --globe-cap-outline: #dbe9ff;
   --globe-border: #c6d4ea;
   --globe-atmosphere: #1c4ed8;
   --color-void: #eef1f5;
@@ -171,8 +177,9 @@
 [data-theme="observatory"] {
   --globe-cap: rgba(34, 211, 238, 0.13);
   --globe-cap-dim: rgba(34, 211, 238, 0.07);
-  --globe-cap-hover: rgba(190, 238, 250, 0.34);
-  --globe-cap-selected: rgba(34, 211, 238, 0.52);
+  --globe-cap-hover: rgba(206, 244, 252, 0.5);
+  --globe-cap-selected: rgba(103, 232, 249, 0.93);
+  --globe-cap-outline: #ddf9ff;
   /* The limb here is almost black, so the border has to be a genuinely bright
      cyan to register as a line at all. */
   --globe-border: #6fbad4;

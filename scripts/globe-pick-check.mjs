@@ -1,37 +1,79 @@
-// Hover regression gate for the country selector.
+// End-to-end gate for the things that can only be checked in a real browser.
 //
-// The original bug: every country cap sat at polygonAltitude 0, which three-globe
-// applies as a mesh scale of exactly 1 — coplanar with the globe mesh. Z-fighting
-// aside, the raycast was numerically unreliable, so hovering/clicking silently
-// dropped a large random-looking share of countries.
+// SCOPE — AND WHY IT IS SMALL
 //
-// This asserts the invariant that matters: every pixel whose raycast lands on a
-// near-side country cap must produce a hover for that country. Run it against a
-// dev server. Usage: node scripts/globe-pick-check.mjs [url]
+// This used to sweep hundreds of pixels one at a time, and took over 25 minutes.
+// Nearly all of that was harness cost: every sample needed a synthetic pointer move
+// plus a settled frame before the DOM could be read back, and headless WebGL is
+// CPU-bound. The picking *rule* those pixels were testing now lives in
+// `app/lib/pick.ts` and is covered exhaustively — and about a hundred times faster
+// — by `scripts/globe-pick-geometry.mjs`, which needs no browser at all. Check the
+// geometry there; reserve the browser for wiring that only exists at runtime:
+//
+//   1. hover actually reaches the header readout, and agrees with the live scene
+//   2. ocean stays silent end-to-end (the far-side regression, through the UI)
+//   3. a selection repaints the caps when the pointer is off the canvas
+//   4. the region rail dims other regions
+//   5. the draw-call budget holds
+//   6. the player's progress bar renders (a Tailwind v4 regression, see NowPlaying)
+//   7. Media Session handlers are installed, so the MacBook transport keys land
+//
+// Run it against a dev server. Usage: node scripts/globe-pick-check.mjs [url]
 import { chromium } from "playwright";
 
 const URL_ = process.argv[2] ?? "http://localhost:5173/?c=US";
-const MIN_RATE = 0.97;
-/** The app must agree with its own scene. The only allowance is the frame of
- *  slop between our raycast and the app's rAF-coalesced one, which matters on
- *  shared borders where the two sides are within a pixel of each other. */
-const MAX_WRONG = 0.01;
-const STEP = 29; // px between samples; co-prime-ish with the grid to avoid aliasing
-/** Keep one in N ocean points. Every hovered pixel costs a real pointer move and
- *  a settled frame, and headless WebGL is CPU-bound, so the gate is paced for
- *  a laptop, not for a workstation. This still sweeps ~300 points of surface. */
-const OCEAN_EVERY = 3;
-const HOVER_SETTLE_MS = 90;
+/** Pixels per axis step. Small on purpose — see SCOPE above. */
+const STEP = 97;
+/** How many land pixels must name a country. A smoke test, not a benchmark. */
+const MIN_LAND = 12;
+const MIN_OCEAN = 12;
+/** Draw calls must stay in the hundreds, not the thousands. */
+const MAX_CALLS = 1200;
 
-/** This gate hovers ~1600 pixels one at a time and takes minutes. Progress goes
- *  to stderr so a hang is locatable instead of a silent five-minute wait. */
-const stage = (name) => process.stderr.write(`  [${new Date().toISOString().slice(11, 19)}] ${name}\n`);
+const stage = (name) =>
+  process.stderr.write(`  [${new Date().toISOString().slice(11, 19)}] ${name}\n`);
+
+const results = [];
+const check = (name, pass, detail) => {
+  results.push({ name, pass, detail });
+  console.log(`${pass ? "PASS" : "FAIL"} ${name}${detail ? ` — ${detail}` : ""}`);
+};
 
 const browser = await chromium.launch();
 const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+const pageErrors = [];
+page.on("pageerror", (e) => pageErrors.push(String(e)));
+page.on("console", (m) => {
+  if (m.type() === "error") pageErrors.push(m.text().slice(0, 160));
+});
+
+// Record which Media Session actions the app subscribes to.
+//
+// Chrome exposes no way to read the installed handlers back, and headless
+// Chromium does not turn synthesised key events into media-key actions at all — so
+// neither "was a handler registered" nor "does the key arrive" can be observed the
+// obvious way. Wrapping `setActionHandler` before any app code runs answers the
+// first question exactly, and the transport buttons already cover whether the
+// callbacks those handlers invoke actually work.
+await page.addInitScript(() => {
+  window.__msActions = [];
+  const install = () => {
+    const ms = navigator.mediaSession;
+    if (!ms || ms.__wrapped) return;
+    const original = ms.setActionHandler.bind(ms);
+    ms.setActionHandler = (action, handler) => {
+      window.__msActions.push(action);
+      return original(action, handler);
+    };
+    ms.__wrapped = true;
+  };
+  install();
+  // navigator.mediaSession can appear after the document starts in some builds.
+  document.addEventListener("readystatechange", install, { once: true });
+});
+
 stage("opening " + URL_);
 await page.goto(URL_, { waitUntil: "networkidle" });
-stage("waiting for the globe");
 await page.waitForFunction(() => !!window.__globe, null, { timeout: 30_000 });
 await page.waitForTimeout(2500);
 stage("globe ready");
@@ -43,148 +85,51 @@ await page.evaluate(() => {
 });
 
 /**
- * The pick the scene says a pixel should produce.
+ * The independent oracle, installed in the page.
  *
- * This is deliberately an independent reimplementation of the rule rather than
- * a call into the app: hits are sorted near→far, the first country cap wins, and
- * the globe sphere terminates the search because everything past it is on the
- * far side of the planet. The atmosphere shell, the merged border layer and the
- * selection rings are transparent to the pointer by design.
+ * Deliberately a reimplementation of the rule rather than a call into the app:
+ * hits sorted near→far, the first country cap wins, and the globe sphere ends the
+ * search because everything past it is on the far side of the planet. The
+ * atmosphere shell, the merged border layer, the selection outline and the pulse
+ * rings are transparent to the pointer by design.
  */
-const ORACLE = `
-  const typeOf = (o) => { while (o) { if (o.__globeObjType) return o.__globeObjType; o = o.parent; } return null; };
-  const datumOf = (o) => { while (o) { const d = o.__data && o.__data.data; if (d && d.iso) return d; o = o.parent; } return null; };
-  function oracle(THREE, globe, px, py, W, H) {
-    const rc = new THREE.Raycaster();
-    rc.setFromCamera(new THREE.Vector2((px / W) * 2 - 1, -(py / H) * 2 + 1), globe.camera());
-    for (const hit of rc.intersectObject(globe.scene(), true)) {
-      const type = typeOf(hit.object);
-      if (type === "polygon") { const d = datumOf(hit.object); return d ? d.iso : null; }
-      if (type === "globe") return null;
+await page.evaluate(async () => {
+  const THREE = await import("/node_modules/three/build/three.module.js");
+  window.__THREE = THREE;
+  const typeOf = (o) => {
+    while (o) {
+      if (o.__globeObjType) return o.__globeObjType;
+      o = o.parent;
     }
     return null;
-  }
-  window.__oracle = oracle;
-`;
-
-/**
- * The oracle needs a `Raycaster`, and `three` is bundled into the app rather
- * than exposed on `window`. Vite serves it as a real module from the dev server,
- * so borrow it from there — trying the page's own origin first means this also
- * works against a production server, as long as a dev server is running.
- */
-const THREE_URLS = [
-  "/node_modules/three/build/three.module.js",
-  "http://localhost:5173/node_modules/three/build/three.module.js",
-];
-
-const threeSource = await page.evaluate(async (urls) => {
-  for (const url of urls) {
-    try {
-      await import(/* @vite-ignore */ url);
-      return url;
-    } catch {
-      /* try the next one */
+  };
+  const datumOf = (o) => {
+    while (o) {
+      const d = o.__data && o.__data.data;
+      if (d && d.iso) return d;
+      o = o.parent;
     }
-  }
-  return null;
-}, THREE_URLS);
-if (!threeSource) {
-  throw new Error(
-    `could not load three for the oracle. Tried:\n  ${THREE_URLS.join("\n  ")}\n` +
-      `Start a dev server (npm run dev) and re-run.`
-  );
-}
-
-// Install the oracle once. `three` is stashed on `window` so the per-pixel
-// evaluates below stay synchronous and cheap; we only borrow the Raycaster.
-await page.evaluate(
-  async ([src, url]) => {
-    window.__THREE = await import(/* @vite-ignore */ url);
-    // eslint-disable-next-line no-eval
-    eval(src);
-  },
-  [ORACLE, threeSource]
-);
-
-/** Expected pick for a screen pixel, measured against the scene *as it is right
- *  now* (the selection lift changes geometry under a stationary pointer). */
-const expectedAt = (x, y) =>
-  page.evaluate(
-    ([px, py]) => window.__oracle(window.__THREE, window.__globe, px, py, innerWidth, innerHeight),
-    [x, y]
-  );
-
-/**
- * Screen points to test, split by what the scene says is there:
- *   land  — a near-side cap. The app must name it.
- *   ocean — the globe surface, no cap. The app must name NOTHING. This is the
- *           regression guard for the far-side bug: the library's filter could
- *           only reject the sphere, so the scan ran on past it and reported
- *           countries on the far side of the planet (Tanzania for a pixel over
- *           Brazil) with nothing highlighted on screen at all.
- *
- * One raycast per pixel, classified once. Running the oracle and then a second
- * full-scene raycast to tell ocean from open space doubled the most expensive
- * part of the gate for nothing.
- */
-const { land, ocean } = await page.evaluate(
-  ([step, oceanEvery]) => {
-    const THREE = window.__THREE;
-    const globe = window.__globe;
-    const W = window.innerWidth;
-    const H = window.innerHeight;
-    const typeOf = (o) => {
-      while (o) {
-        if (o.__globeObjType) return o.__globeObjType;
-        o = o.parent;
-      }
-      return null;
-    };
-    const datumOf = (o) => {
-      while (o) {
-        const d = o.__data && o.__data.data;
-        if (d && d.iso) return d;
-        o = o.parent;
-      }
-      return null;
-    };
+    return null;
+  };
+  window.__oracle = (x, y, W, H) => {
+    const g = window.__globe;
     const rc = new THREE.Raycaster();
-    const land = [];
-    const ocean = [];
-    let n = 0;
-    for (let y = 100; y < H - 100; y += step) {
-      for (let x = 80; x < W - 80; x += step) {
-        n++;
-        rc.setFromCamera(new THREE.Vector2((x / W) * 2 - 1, -(y / H) * 2 + 1), globe.camera());
-        let kind = "space";
-        for (const h of rc.intersectObject(globe.scene(), true)) {
-          const t = typeOf(h.object);
-          if (t === "polygon") {
-            if (datumOf(h.object)) {
-              kind = "land";
-            }
-            break;
-          }
-          if (t === "globe") {
-            kind = "ocean";
-            break;
-          }
-        }
-        if (kind === "land") land.push([x, y]);
-        // The ocean sweep is the guard against far-side picks, which are a
-        // property of the sphere, not of any one country — a third of the
-        // points guard it just as well as all of them, at a third of the cost.
-        else if (kind === "ocean" && n % oceanEvery === 0) ocean.push([x, y]);
+    rc.setFromCamera(new THREE.Vector2((x / W) * 2 - 1, -(y / H) * 2 + 1), g.camera());
+    for (const hit of rc.intersectObject(g.scene(), true)) {
+      const t = typeOf(hit.object);
+      if (t === "polygon") {
+        const d = datumOf(hit.object);
+        return d ? d.iso : null;
       }
+      if (t === "globe") return null;
     }
-    return { land, ocean };
-  },
-  [STEP, OCEAN_EVERY]
-);
+    return null;
+  };
+  // Exposed for the cap-material probes below, which must resolve the datum the
+  // same way rather than assuming `__data` sits on the tagged object.
+  window.__datumOf = datumOf;
+});
 
-const missed = [];
-const mismatched = [];
 const readHover = () =>
   page.evaluate(() => {
     const p = document.querySelector("header p");
@@ -192,153 +137,334 @@ const readHover = () =>
     return m ? m[1] : "";
   });
 
-/** This gate hovers ~1600 pixels one at a time and takes minutes. Progress goes
- *  to stderr so a hang is locatable instead of a silent five-minute wait. */
-const progress = (label, i, total) => {
-  if (i % 100 === 0 || i === total) {
-    process.stderr.write(`  [${new Date().toISOString().slice(11, 19)}] ${label} ${i}/${total}\n`);
+// ---------------------------------------------------------------------------
+// 0. A deep link must light its country on load, with no interaction at all.
+//    Checked FIRST, before anything moves the pointer.
+// ---------------------------------------------------------------------------
+stage("checking cold-load deep link");
+const deepLink = await page.evaluate(async () => {
+  // three-globe finishes building the 266 caps asynchronously, so give it the same
+  // runway a human would before judging it.
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  let caps = 0;
+  for (let i = 0; i < 40; i++) {
+    caps = 0;
+    window.__globe.scene().traverse((o) => {
+      if (o.__globeObjType === "polygon") caps++;
+    });
+    if (caps > 0) break;
+    await sleep(100);
   }
-};
+  await sleep(1200);
+  const iso = new URLSearchParams(location.search).get("c");
+  let state = null;
+  window.__globe.scene().traverse((o) => {
+    if (state || o.__globeObjType !== "polygon") return;
+    const d = window.__datumOf(o);
+    if (!d || d.iso !== iso) return;
+    const cap = o.children[0];
+    const m = Array.isArray(cap.material) ? cap.material[1] : null;
+    state = { hex: m ? m.color.getHexString() : null, opacity: m ? +m.opacity.toFixed(3) : null };
+  });
+  return { iso, caps, state };
+});
+check(
+  "deep link lights its country without interaction",
+  deepLink.caps > 0 && !!deepLink.state && deepLink.state.opacity !== null && deepLink.state.opacity > 0.5,
+  `${deepLink.iso}: ${deepLink.state?.hex}@${deepLink.state?.opacity} after ${deepLink.caps} caps (no pointer moved)`
+);
 
-stage(`sampled: ${land.length} land, ${ocean.length} ocean`);
-for (const [i, [x, y]] of land.entries()) {
+// ---------------------------------------------------------------------------
+// 1 + 2. Land pixels must name their country; ocean must stay silent.
+// ---------------------------------------------------------------------------
+stage("sampling pixels");
+const samples = await page.evaluate(
+  ([step]) => {
+    const W = window.innerWidth;
+    const H = window.innerHeight;
+    const land = [];
+    const ocean = [];
+    for (let y = 120; y < H - 120; y += step) {
+      for (let x = 120; x < W - 120; x += step) {
+        const iso = window.__oracle(x, y, W, H);
+        // `undefined` means the ray hit something that is neither a country cap nor
+        // the globe (open sky). Those are excluded: the caps are lifted, so a
+        // sliver of a near-limb country is legitimately visible against the sky.
+        if (iso === null) ocean.push([x, y]);
+        else if (iso) land.push([x, y, iso]);
+      }
+    }
+    return { land, ocean };
+  },
+  [STEP]
+);
+
+stage(`sweeping ${samples.land.length} land, ${samples.ocean.length} ocean`);
+const missed = [];
+const mismatched = [];
+for (const [x, y] of samples.land) {
   await page.mouse.move(x, y);
-  await page.waitForTimeout(HOVER_SETTLE_MS);
+  await page.waitForTimeout(70);
   const hovered = await readHover();
   if (!hovered) {
-    // Re-measure now. If the scene no longer has a cap here, the sample list
-    // was stale (something moved the camera) and this is not an app miss.
-    const still = await expectedAt(x, y);
-    missed.push(still ? [x, y, still] : [x, y]);
-    progress("land", i + 1, land.length);
+    // Re-measure: if the scene has no cap here now, the sample list was stale.
+    const still = await page.evaluate(([px, py]) => window.__oracle(px, py, innerWidth, innerHeight), [x, y]);
+    if (still) missed.push(`${x},${y}(wants ${still})`);
     continue;
   }
-  const expected = await expectedAt(x, y);
-  if (expected && hovered !== expected) mismatched.push([x, y, hovered, expected]);
-  progress("land", i + 1, land.length);
+  if (hovered !== samples.land.find((s) => s[0] === x && s[1] === y)[2]) {
+    mismatched.push(`${x},${y}=${hovered}`);
+  }
 }
 
-// Ocean must stay silent. Any ISO here is a country on the hidden hemisphere.
 const ghost = [];
-for (const [i, [x, y]] of ocean.entries()) {
+for (const [x, y] of samples.ocean) {
   await page.mouse.move(x, y);
-  await page.waitForTimeout(HOVER_SETTLE_MS);
+  await page.waitForTimeout(60);
   const hovered = await readHover();
-  if (hovered) ghost.push([x, y, hovered]);
-  progress("ocean", i + 1, ocean.length);
+  if (hovered) ghost.push(`${x},${y}=${hovered}`);
 }
 
-/**
- * The selection must repaint the caps on its own.
- *
- * The repaint used to hang off the hover only, so it fired when the pointer
- * happened to be over the globe and not otherwise: selecting a country from the
- * ⌘K palette, the region rail, Surprise me or the back button left the PREVIOUS
- * country lit up and the new one unlit until the pointer next moved.
- *
- * Driven through the real picker with the pointer parked off the canvas — the
- * exact case that used to break. A synthetic `pushState` + `popstate` is not
- * enough: React Router owns its own history index and ignores that sequence, so
- * the app never actually changes selection and the check passes for the wrong
- * reason.
- */
+check(
+  "land pixels name their country",
+  samples.land.length >= MIN_LAND && missed.length === 0 && mismatched.length === 0,
+  `${samples.land.length} sampled, ${missed.length} missed ${missed.slice(0, 4).join(" ")}, ${mismatched.length} wrong ${mismatched.slice(0, 4).join(" ")}`
+);
+check(
+  "ocean stays silent (no far-side picks)",
+  samples.ocean.length >= MIN_OCEAN && ghost.length === 0,
+  `${samples.ocean.length} sampled, ${ghost.length} far-side ${ghost.slice(0, 4).join(" ")}`
+);
+
+// ---------------------------------------------------------------------------
+// 3. A selection must repaint the caps on its own.
+// ---------------------------------------------------------------------------
+stage("checking selection repaint");
 const capState = (iso) =>
   page.evaluate((want) => {
     let out = null;
     window.__globe.scene().traverse((o) => {
       if (o.__globeObjType !== "polygon") return;
-      const i = o.__data && o.__data.data && o.__data.data.iso;
-      if (i !== want) return;
+      const d = window.__datumOf(o);
+      if (!d || d.iso !== want) return;
       const cap = o.children[0];
       const m = Array.isArray(cap.material) ? cap.material[1] : null;
-      out = { lift: +cap.scale.x.toFixed(4), opacity: m ? +m.opacity.toFixed(2) : null };
+      out = { lift: +cap.scale.x.toFixed(4), opacity: m ? +m.opacity.toFixed(3) : null, hex: m ? m.color.getHexString() : null };
     });
     return out;
   }, iso);
 
-// Park the pointer off the globe so nothing repaints by accident.
+// Park the pointer off the globe so nothing repaints by accident. This is the case
+// that used to break: the repaint hung off the hover, so selecting from the ⌘K
+// palette, the region rail, Surprise me or the back button — all of which leave the
+// pointer off the canvas — left the previous country lit and the new one unlit.
+//
+// Driven through the real picker. A synthetic `pushState` + `popstate` is not
+// enough: React Router owns its own history index and ignores that sequence, so the
+// app never changes selection and the check passes for the wrong reason.
 await page.mouse.move(1400, 450);
-stage("checking selection repaint");
 const startIso = await page.evaluate(() => new URLSearchParams(location.search).get("c"));
-
-// Open the picker by its header control, then choose the first result. The URL
-// reports which country that was, which is more reliable than scraping the ISO
-// out of the row's text — the badge and the name are adjacent, so "DZAlgeria"
-// has no word boundary for `\b[A-Z]{2}\b` to find.
-await page.evaluate(() => {
-  document.querySelector('header button[aria-haspopup="dialog"]').click();
-});
+await page.evaluate(() => document.querySelector('header button[aria-haspopup="dialog"]').click());
 await page.waitForSelector('[role="listbox"][aria-label="Countries"] li[role="option"] button', {
   timeout: 10_000,
 });
-await page.evaluate(() => {
-  document.querySelector('[role="listbox"] li[role="option"] button').click();
-});
-await page.waitForTimeout(2200);
-
+await page.evaluate(() => document.querySelector('[role="listbox"] li[role="option"] button').click());
+await page.waitForTimeout(1800);
 const selAfterPick = await page.evaluate(() => new URLSearchParams(location.search).get("c"));
 const newCap = await capState(selAfterPick);
 const oldCap = await capState(startIso);
-// Relative, so it does not have to track CAP_SELECTED: the selection has to have
-// actually moved, the new one must be lifted, and the old one must have dropped
-// back to the base altitude.
+
+// Assert the FILL, not the lift. `lift` cannot fail this check: three-globe applies
+// `polygonAltitude` as the mesh scale itself, so the selected country reads 1.03
+// whether or not the repaint ever ran — which is exactly how a genuinely broken
+// repaint (caps not built yet when the effect fired, so a deep link loaded unlit)
+// sailed through a gate that "verified" it for a whole session. Only the colour and
+// opacity are written by `applyHoverVisuals`, so only they can prove it ran.
 const repaint =
   !!startIso &&
   !!selAfterPick &&
   selAfterPick !== startIso &&
   !!newCap &&
   !!oldCap &&
-  newCap.lift > 1.01 &&
-  oldCap.lift < 1.01;
+  newCap.opacity !== null &&
+  oldCap.opacity !== null &&
+  newCap.opacity > 0.5 &&
+  oldCap.opacity < 0.5;
+check(
+  "selection repaints the cap fill with the pointer off-canvas",
+  repaint,
+  `${startIso} -> ${selAfterPick}, new ${newCap?.hex}@${newCap?.opacity} lift ${newCap?.lift}, old ${oldCap?.hex}@${oldCap?.opacity} lift ${oldCap?.lift}`
+);
 
-// Draw calls: the other half of the regression. The old single-map globe spent
+// ---------------------------------------------------------------------------
+// 4. The region rail has to actually dim the other regions.
+// ---------------------------------------------------------------------------
+stage("checking region filter");
+const regionResult = await page.evaluate(async () => {
+  // Walk up for the datum, the way the app's own `datumOf` does — three-globe
+  // attaches `__data` to the object it generated, but not always to the one that
+  // carries `__globeObjType`, and a shallow lookup silently yields null for every
+  // country, which reads as "the filter did nothing".
+  const datumOf = (o) => {
+    while (o) {
+      const d = o.__data && o.__data.data;
+      if (d && d.iso) return d;
+      o = o.parent;
+    }
+    return null;
+  };
+  const pick = (iso) => {
+    let out = null;
+    window.__globe.scene().traverse((o) => {
+      if (o.__globeObjType !== "polygon") return;
+      if (datumOf(o)?.iso !== iso) return;
+      const cap = o.children[0];
+      const m = Array.isArray(cap.material) ? cap.material[1] : null;
+      out = m ? +m.opacity.toFixed(3) : null;
+    });
+    return out;
+  };
+  // Two countries in different regions, neither of which is the selection.
+  const regions = new Map();
+  window.__globe.scene().traverse((o) => {
+    if (o.__globeObjType !== "polygon") return;
+    const d = datumOf(o);
+    if (!d || !d.region || regions.has(d.region)) return;
+    regions.set(d.region, d.iso);
+  });
+  const names = Array.from(regions.keys());
+  if (names.length < 2) return { err: "not enough regions in the scene" };
+  const [inRegion, outRegion] = names;
+  // `pick` takes an ISO, not a region name — the map is keyed by region.
+  const inIso = regions.get(inRegion);
+  const outIso = regions.get(outRegion);
+  if (!pick(inIso) || !pick(outIso)) return { err: `could not read opacities for ${inIso}/${outIso}` };
+
+  const chip = Array.from(document.querySelectorAll('nav[aria-label="Filter by region"] button')).find(
+    (b) => (b.textContent || "").trim().startsWith(inRegion)
+  );
+  if (!chip) return { err: `no chip for ${inRegion}` };
+  const before = { in: pick(inIso), out: pick(outIso) };
+  chip.click();
+  await new Promise((r) => setTimeout(r, 700));
+  const after = { in: pick(inIso), out: pick(outIso), pressed: chip.getAttribute("aria-pressed") };
+  chip.click();
+  await new Promise((r) => setTimeout(r, 700));
+  const cleared = { in: pick(inIso), out: pick(outIso) };
+  return { inRegion, outRegion, inIso, outIso, before, after, cleared };
+});
+check(
+  "region filter dims other regions",
+  !regionResult.err &&
+    regionResult.after.out < regionResult.before.out &&
+    regionResult.after.pressed === "true" &&
+    regionResult.cleared.out > regionResult.after.out,
+  regionResult.err ??
+    `${regionResult.inRegion}/${regionResult.inIso} ${regionResult.before.in} -> ${regionResult.after.in} (kept), ` +
+      `${regionResult.outRegion}/${regionResult.outIso} ${regionResult.before.out} -> ${regionResult.after.out} (dimmed) -> ${regionResult.cleared.out} (cleared)`
+);
+
+// ---------------------------------------------------------------------------
+// 5. Draw calls. The other half of the regression: the old single-map globe spent
 // ~8200 per frame; the two-layer build must stay in the hundreds.
-const perf = await page.evaluate(
-  () =>
-    new Promise((resolve) => {
-      let frames = 0;
-      const t0 = performance.now();
-      const tick = () => {
-        frames++;
-        if (performance.now() - t0 < 2000) requestAnimationFrame(tick);
-        else
-          resolve({
-            fps: Math.round(frames / ((performance.now() - t0) / 1000)),
-            calls: window.__globe.renderer().info.render.calls,
-          });
-      };
-      requestAnimationFrame(tick);
-    })
+// ---------------------------------------------------------------------------
+const calls = await page.evaluate(() => window.__globe.renderer().info.render.calls);
+check("draw calls stay bounded", calls > 0 && calls < MAX_CALLS, `${calls} (need < ${MAX_CALLS})`);
+
+// ---------------------------------------------------------------------------
+// 6 + 7. The player. Both of these shipped broken and neither is about the globe.
+// ---------------------------------------------------------------------------
+stage("checking the player");
+await page.evaluate(() => document.querySelector("li button").click());
+await page.waitForTimeout(5000);
+const player = await page.evaluate(() => {
+  const bars = document.querySelectorAll("span.origin-left");
+  const progress = bars[1];
+  const buffered = bars[0];
+  const time = Array.from(document.querySelectorAll("span.tnum")).find((s) =>
+    /\d+:\d\d/.test(s.textContent)
+  );
+  return {
+    // The Tailwind v4 trap: `scale-x-0` compiles to the standalone `scale` property,
+    // which composes with an inline `transform` instead of being replaced by it, so
+    // the bar collapsed to zero width while the time label and click-to-seek carried
+    // on working. A rendered width above zero is the whole assertion.
+    progressW: progress ? Math.round(progress.getBoundingClientRect().width) : null,
+    trackW: progress && progress.parentElement ? Math.round(progress.parentElement.getBoundingClientRect().width) : null,
+    bufferedW: buffered ? Math.round(buffered.getBoundingClientRect().width) : null,
+    progressTransform: progress ? progress.style.transform : null,
+    time: time ? time.textContent : null,
+    hasMediaSession: !!navigator.mediaSession,
+    metadata: navigator.mediaSession && navigator.mediaSession.metadata
+      ? {
+          title: navigator.mediaSession.metadata.title,
+          artist: navigator.mediaSession.metadata.artist,
+          artwork: navigator.mediaSession.metadata.artwork.length,
+        }
+      : null,
+    playbackState: navigator.mediaSession ? navigator.mediaSession.playbackState : null,
+  };
+});
+check(
+  "player progress bar renders",
+  player.progressW !== null && player.progressW > 0 && player.trackW > 0 && /scaleX\(0?\.\d*[1-9]/.test(player.progressTransform ?? ""),
+  `progress ${player.progressW}px of ${player.trackW}px, buffered ${player.bufferedW}px, time ${player.time}`
+);
+check(
+  "Media Session metadata set for the OS transport",
+  player.hasMediaSession && !!player.metadata && !!player.metadata.title,
+  player.metadata ? `${player.metadata.title} / ${player.metadata.artist} / ${player.metadata.artwork} artwork, state ${player.playbackState}` : "no metadata"
 );
 
-const rate = land.length ? (land.length - missed.length) / land.length : 0;
-const wrongRate = land.length ? mismatched.length / land.length : 1;
-const ok =
-  land.length > 100 &&
-  ocean.length > 50 &&
-  rate >= MIN_RATE &&
-  wrongRate <= MAX_WRONG &&
-  ghost.length === 0 &&
-  repaint &&
-  perf.calls < 1200;
+/**
+ * The media keys themselves.
+ *
+ * Proved two ways, because neither alone is enough. `__msActions` records which
+ * actions the page subscribed to — the MacBook's next/previous keys arrive as
+ * `nexttrack`/`previoustrack`, and nothing happens at all without them, which is
+ * exactly how this shipped broken. Then the transport is exercised through the UI
+ * to show the callbacks those handlers invoke really do change the track.
+ */
+const registered = await page.evaluate(() => [...new Set(window.__msActions ?? [])]);
+const WANTED = ["previoustrack", "nexttrack", "play", "pause", "seekbackward", "seekforward", "seekto"];
+const missing = WANTED.filter((a) => !registered.includes(a));
+check(
+  "Media Session transport handlers installed",
+  missing.length === 0,
+  missing.length ? `missing ${missing.join(", ")} (registered: ${registered.join(", ") || "none"})` : `registered ${registered.join(", ")}`
+);
 
-console.log(`land pixels sampled : ${land.length}`);
-console.log(`hover hit rate      : ${(rate * 100).toFixed(1)}% (need >= ${MIN_RATE * 100}%)`);
-console.log(`mismatched country  : ${mismatched.length} (${(wrongRate * 100).toFixed(1)}%, allow <= ${MAX_WRONG * 100}%)`);
-console.log(
-  `missed samples      : ${missed.slice(0, 8).map((m) => (m[2] ? `${m[0]}@${m[1]}(wants ${m[2]})` : m.join("@"))).join(" ") || "none"}`
+const queueTitle = () =>
+  page.evaluate(() => {
+    const section = document.querySelector('section[aria-label="Now playing"]');
+    if (!section) return null;
+    // The title is the first truncating element in the player that has text.
+    const el = Array.from(section.querySelectorAll('div[class*="truncate"], span[class*="truncate"]')).find(
+      (n) => n.textContent.trim().length > 0
+    );
+    return el ? el.textContent.trim() : null;
+  });
+const before = await queueTitle();
+const nextBtn = await page.evaluate(() => {
+  const b = document.querySelector('button[aria-label="Next track"]');
+  if (!b) return null;
+  const r = b.getBoundingClientRect();
+  return [Math.round(r.x + r.width / 2), Math.round(r.y + r.height / 2)];
+});
+if (nextBtn) await page.mouse.click(nextBtn[0], nextBtn[1]);
+await page.waitForTimeout(1800);
+const after = await queueTitle();
+check(
+  "next-track transport changes the track",
+  !!before && !!after && before !== after,
+  `${before} -> ${after}`
 );
-console.log(`mismatch detail     : ${mismatched.slice(0, 8).map((m) => `${m[0]},${m[1]} app=${m[2]} scene=${m[3]}`).join(" | ") || "none"}`);
-console.log(`ocean pixels sampled: ${ocean.length}`);
-console.log(
-  `far-side picks      : ${ghost.length} (need 0) ${ghost.slice(0, 6).map((g) => `${g[0]},${g[1]}=${g[2]}`).join(" ") || ""}`
-);
-console.log(
-  `selection repaints  : ${repaint ? "yes" : "NO"} (${startIso} -> ${selAfterPick}, new lift ${newCap?.lift}, old ${oldCap?.lift})`
-);
-console.log(`draw calls / frame  : ${perf.calls} (need < 1200)`);
-console.log(`fps                 : ${perf.fps}`);
+
+check("no page errors", pageErrors.length === 0, pageErrors.slice(0, 3).join(" | "));
 
 await browser.close();
-console.log(ok ? "globe pick checks passed" : "globe pick checks FAILED");
-process.exit(ok ? 0 : 1);
+
+const failed = results.filter((r) => !r.pass);
+console.log("");
+console.log(`${results.length - failed.length}/${results.length} browser checks passed`);
+process.exit(failed.length ? 1 : 0);

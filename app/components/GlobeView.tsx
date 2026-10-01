@@ -5,10 +5,10 @@ import {
   LineBasicMaterial,
   LineSegments,
   Object3D,
-  Ray,
   Raycaster,
   Vector2,
 } from "three";
+import { firstUnoccluded, GLOBE_RADIUS, surfaceDistance } from "~/lib/pick";
 import type { Region } from "~/lib/countryMeta";
 import type { ThemeTokens } from "~/hooks/useTheme";
 
@@ -25,6 +25,13 @@ export interface StageCountry {
   lat: number;
   lng: number;
   span: number;
+  /**
+   * GeoJSON Polygon/MultiPolygon as loaded from the caps layer. three-globe reads
+   * it for the cap mesh (`polygonGeoJsonGeometry="geometry"`), and the selection
+   * outline reads it to trace that country's edge. Typed loosely so the map loader
+   * stays the single source of truth for the shape.
+   */
+  geometry?: unknown;
 }
 
 // ---------------------------------------------------------------------------
@@ -47,12 +54,23 @@ export interface StageCountry {
 const CAP_BASE = 0.004;
 const CAP_SELECTED = 0.03;
 
+/**
+ * The selection outline sits just outside the lifted cap, so the crisp edge
+ * always wins over the fill it traces.
+ *
+ * A fill on its own is a weak signal for a large country and almost none for a
+ * small one: measured against unselected land, the old `0.6` amber came out at
+ * rgb(156,129,82) — a muddy khaki at 3.5:1, which reads as a wash rather than a
+ * selection. Raising the alpha fixes the fill (7.9:1), but only an outline makes
+ * a six-pixel country findable at all.
+ */
+const OUTLINE_ALTITUDE = CAP_SELECTED + 0.0015;
+
 // The border layer sits just off the globe surface. Above the sphere itself
 // (never 0 — that is the coplanarity trap) and below every cap, so it is always
 // the farthest hit and can never steal a hover.
 const BORDER_ALTITUDE = 0.002;
 
-const GLOBE_RADIUS = 100;
 const IDLE_SPIN_DELAY_MS = 5200;
 const IDLE_SPIN_SPEED = 0.28;
 
@@ -74,6 +92,37 @@ function toCartesian(lng: number, lat: number, altitude: number, out: [number, n
   out[0] = r * s * Math.cos(theta);
   out[1] = r * Math.cos(phi);
   out[2] = r * s * Math.sin(theta);
+}
+
+type Ring = [number, number][];
+
+/**
+ * Every linear ring of a GeoJSON Polygon or MultiPolygon, as [lng, lat] pairs.
+ *
+ * Holes are included deliberately: the outline traces the country's silhouette,
+ * and a hole that was left out would show the fill through the middle of a
+ * country with an enclave in it.
+ */
+function ringsOf(geometry: unknown): Ring[] {
+  const g = geometry as { type?: string; coordinates?: unknown } | null | undefined;
+  if (!g || typeof g !== "object" || !Array.isArray(g.coordinates)) return [];
+  // Polygon: [ring, ring…]. MultiPolygon: [[ring, ring…], …].
+  const polys: unknown[] = g.type === "MultiPolygon" ? g.coordinates : [g.coordinates];
+  const rings: Ring[] = [];
+  for (const poly of polys) {
+    if (!Array.isArray(poly)) continue;
+    for (const ring of poly) {
+      if (!Array.isArray(ring) || ring.length < 2) continue;
+      const out: Ring = [];
+      for (const point of ring) {
+        if (Array.isArray(point) && point.length >= 2 && typeof point[0] === "number") {
+          out.push([point[0], point[1]]);
+        }
+      }
+      if (out.length >= 2) rings.push(out);
+    }
+  }
+  return rings;
 }
 
 /** three-globe tags every object it generates; walk up to the nearest tag. */
@@ -99,33 +148,10 @@ function datumOf(obj: Object3D | null): StageCountry | null {
 }
 
 /**
- * Distance from the ray origin to where it meets the globe's own surface, or
- * `Infinity` if it never does.
- *
- * The planet is the occluder for everything behind it, so "is this cap visible?"
- * reduces to a scalar comparison. Solving `|o + t·d| = R` directly is both exact
- * and free — raycasting the sphere mesh instead drags the 120k-segment border
- * layer and the graticule grid through the loop, which cost 2ms per pick against
- * 0.09ms for the caps alone.
- *
- * `Infinity` and not a small number when the ray misses. The caps are lifted
- * above the sphere, so a sliver of every cap sits *outside* the planet's
- * silhouette and is genuinely visible against the sky there; a ray that misses
- * the sphere has no occluder in front of it, so whatever cap it does hit is a
- * near-limb cap and must be pickable. Returning a near distance instead dropped
- * a band of countries around the limb (Germany, the UK, France, Algeria,
- * Brazil) from hover entirely. Note this cannot let a far-side cap through: any
- * ray that reaches one has passed through the globe, so it always has an
- * occluder in front of it.
+ * The occlusion rule itself lives in `~/lib/pick` — see there for why the planet
+ * has to be the occluder, and for what it cost when three-render-objects owned
+ * that decision instead.
  */
-function surfaceDistance(ray: Ray): number {
-  const o = ray.origin;
-  const d = ray.direction;
-  const b = o.dot(d);
-  const c = o.dot(o) - GLOBE_RADIUS * GLOBE_RADIUS;
-  const disc = b * b - c;
-  return disc < 0 ? Infinity : -b - Math.sqrt(disc);
-}
 
 interface Props {
   countries: StageCountry[];
@@ -319,6 +345,88 @@ export default function GlobeView({
     [palette.border]
   );
 
+  // ------------------------------------------------------- selection outline
+  // A crisp traced edge around the selected country, rebuilt only when the
+  // selection changes — so it costs one draw call and nothing per hover.
+  //
+  // It is imperative rather than a `polygonStrokeColor` accessor on purpose.
+  // three-globe does build a LineSegments per polygon, but with the strokes
+  // disabled it comes out `visible: false` with a zero-vertex geometry, and
+  // turning strokes on would mean changing a polygon prop's identity — which
+  // re-digests all 266 caps (see AGENTS.md) and adds a draw call per country.
+  // One merged line for the one selected country is cheaper and sharper.
+  //
+  // It is never raycast: `pickAt` only ever tests `picker.caps`, which is
+  // collected by looking for three-globe's `polygon` tag, and this object has
+  // none. So the outline cannot steal a hover from the cap it traces.
+  const outlineRef = useRef<LineSegments | null>(null);
+  useEffect(() => {
+    const g = globeRef.current;
+    const scene = g?.scene?.() as Object3D | undefined;
+    if (!scene) return;
+
+    const dispose = () => {
+      const previous = outlineRef.current;
+      if (!previous) return;
+      scene.remove(previous);
+      previous.geometry.dispose();
+      (previous.material as LineBasicMaterial).dispose();
+      outlineRef.current = null;
+    };
+
+    const country = selectedIso ? countries.find((c) => c.iso === selectedIso) : null;
+    const rings = country ? ringsOf(country.geometry) : [];
+    if (rings.length === 0) {
+      dispose();
+      return;
+    }
+
+    const positions: number[] = [];
+    const v: [number, number, number] = [0, 0, 0];
+    for (const ring of rings) {
+      // GeoJSON rings repeat their first point last; `i + 1 < length` already
+      // closes them, so the duplicate is simply not emitted twice.
+      for (let i = 0; i + 1 < ring.length; i++) {
+        toCartesian(ring[i][0], ring[i][1], OUTLINE_ALTITUDE, v);
+        positions.push(v[0], v[1], v[2]);
+        toCartesian(ring[i + 1][0], ring[i + 1][1], OUTLINE_ALTITUDE, v);
+        positions.push(v[0], v[1], v[2]);
+      }
+    }
+    if (positions.length === 0) {
+      dispose();
+      return;
+    }
+
+    // Replace only once the replacement is built, so a country with unusable
+    // geometry leaves the previous outline alone rather than blanking it.
+    const geometry = new BufferGeometry();
+    geometry.setAttribute("position", new Float32BufferAttribute(positions, 3));
+    const outline = new LineSegments(
+      geometry,
+      new LineBasicMaterial({
+        color: palette.capOutline,
+        transparent: true,
+        opacity: 0.95,
+        depthWrite: false,
+      })
+    );
+    dispose();
+    scene.add(outline);
+    outlineRef.current = outline;
+  }, [sceneReady, selectedIso, countries, palette.capOutline]);
+
+  useEffect(() => {
+    return () => {
+      const previous = outlineRef.current;
+      if (!previous) return;
+      previous.parent?.remove(previous);
+      previous.geometry.dispose();
+      (previous.material as LineBasicMaterial).dispose();
+      outlineRef.current = null;
+    };
+  }, []);
+
   // ------------------------------------------------------------- cap styling
   // CRITICAL: these accessors must be referentially stable for the lifetime of
   // the scene. three-globe re-digests (and rebuilds the geometry of) every
@@ -363,11 +471,12 @@ export default function GlobeView({
    * `globeGroup()` is not part of the public API, so calling it silently no-ops
    * and no highlight ever appears.
    */
-  const applyHoverVisuals = useCallback(() => {
+  const applyHoverVisuals = useCallback((): number => {
     const scene = globeRef.current?.scene?.();
-    if (!scene) return;
+    if (!scene) return 0;
     const selected = selectedIsoRef.current;
     const hovered = hoverIsoRef.current;
+    let styled = 0;
     scene.traverse((obj: unknown) => {
       const g = obj as {
         __globeObjType?: string;
@@ -378,6 +487,7 @@ export default function GlobeView({
       const datum = g.__data?.data;
       const iso = datum?.iso;
       if (typeof iso !== "string") return;
+      styled++;
 
       const isSelected = iso === selected;
       const isHovered = iso === hovered;
@@ -430,11 +540,11 @@ export default function GlobeView({
         }
       }
     });
+    return styled;
   }, [palette, regionFilter]);
 
   /**
-   * Repaint whenever the *selection* or the *region filter* changes, and once
-   * more shortly after mount because three-globe builds the caps asynchronously.
+   * Repaint whenever the *selection* or the *region filter* changes.
    *
    * Hover is deliberately absent: it is applied synchronously inside the pointer
    * handler, so the cap under the cursor is already correct before the next pick
@@ -448,9 +558,28 @@ export default function GlobeView({
    */
   useEffect(() => {
     applyHoverVisuals();
-    const retry = setTimeout(applyHoverVisuals, 400);
-    return () => clearTimeout(retry);
   }, [applyHoverVisuals, selectedIso]);
+
+  /**
+   * Keep repainting until the caps actually exist.
+   *
+   * three-globe builds 266 polygon objects ASYNCHRONOUSLY, well after
+   * `onGlobeReady`. A repaint that runs before that finds no polygons and quietly
+   * does nothing — and the old 400ms retry was a guess at how long that takes, so
+   * on a deep link like `?c=BR` the selected country stayed at the base colour
+   * indefinitely (measured: still unlit at 10s) and only lit up when the pointer
+   * happened to cross a country. Waiting for the caps themselves removes the guess;
+   * a scene traverse is ~0.05ms, and it stops as soon as there is work to do.
+   */
+  useEffect(() => {
+    if (!sceneReady) return;
+    let tries = 0;
+    const id = setInterval(() => {
+      tries += 1;
+      if (applyHoverVisuals() > 0 || tries > 60) clearInterval(id);
+    }, 100);
+    return () => clearInterval(id);
+  }, [sceneReady, applyHoverVisuals]);
 
   // Borders own the outline; three-globe's per-country strokes would cost a draw
   // call each and duplicate what the merged layer already draws crisply.
@@ -501,9 +630,9 @@ export default function GlobeView({
       -((clientY - rect.top) / rect.height) * 2 + 1
     );
     p.rc.setFromCamera(p.ndc, g.camera());
-    const hit = p.rc.intersectObjects(p.caps, true)[0];
-    // No cap, or the cap is on the far side of the planet: nothing to pick.
-    if (!hit || hit.distance >= surfaceDistance(p.rc.ray)) return null;
+    // The rule itself is in ~/lib/pick; this is just the plumbing that feeds it.
+    const hit = firstUnoccluded(p.rc.intersectObjects(p.caps, true), surfaceDistance(p.rc.ray));
+    if (!hit) return null;
     return datumOf(hit.object);
   }, []);
 

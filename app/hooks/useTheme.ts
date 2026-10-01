@@ -52,6 +52,8 @@ export interface ThemeTokens {
     capDim: string;
     capHover: string;
     capSelected: string;
+    /** Crisp traced edge around the selected country. See OUTLINE_ALTITUDE. */
+    capOutline: string;
     border: string;
     atmosphere: string;
   };
@@ -62,11 +64,12 @@ const FALLBACK: ThemeTokens = {
   accentSoft: "#ffd08a",
   accentInk: "#1a1204",
   globe: {
-    cap: "rgba(125, 154, 196, 0.14)",
-    capDim: "rgba(125, 154, 196, 0.04)",
-    capHover: "rgba(255, 208, 138, 0.38)",
-    capSelected: "rgba(255, 208, 138, 0.5)",
-    border: "#7d9ac4",
+    cap: "rgba(150, 180, 222, 0.16)",
+    capDim: "rgba(125, 154, 196, 0.075)",
+    capHover: "rgba(205, 226, 252, 0.5)",
+    capSelected: "rgba(255, 214, 124, 0.93)",
+    capOutline: "#ffe9b0",
+    border: "#a8c4e8",
     atmosphere: "#f5a524",
   },
 };
@@ -87,6 +90,7 @@ export function useThemeTokens(theme: ThemeId): ThemeTokens {
         capDim: read("--globe-cap-dim", FALLBACK.globe.capDim),
         capHover: read("--globe-cap-hover", FALLBACK.globe.capHover),
         capSelected: read("--globe-cap-selected", FALLBACK.globe.capSelected),
+        capOutline: read("--globe-cap-outline", FALLBACK.globe.capOutline),
         border: read("--globe-border", FALLBACK.globe.border),
         atmosphere: read("--globe-atmosphere", FALLBACK.globe.atmosphere),
       },

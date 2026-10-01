@@ -11,10 +11,12 @@ React Router 7 (framework mode) + Vite 8 + React 19. Routes live in `app/routes/
 - Checks: `npm run typecheck` (typegen + tsc) and `npm run build`.
 - Dev server: `npm run dev` (binds `--host` for LAN testing).
 
-## The globe: five rules you must not break
+## The globe: six rules you must not break
 
 These each cost real debugging time. All are enforced by
-`npm run check:globe` (`scripts/globe-pick-check.mjs`).
+`npm run check:globe`, which is two gates: `check:pick`
+(`scripts/globe-pick-geometry.mjs` — no browser, ~600k rays) for the picking rule
+itself, and `globe-pick-check.mjs` for the wiring that only exists at runtime.
 
 1. **A polygon altitude of 0 is a bug, not a default.** three-globe builds polygon
    geometry at `GLOBE_RADIUS` and applies `polygonAltitude` as a uniform mesh scale
@@ -73,6 +75,33 @@ These each cost real debugging time. All are enforced by
    selection independently, so a selected country outside the active region stays
    findable.
 
+6. **The picking rule lives in `app/lib/pick.ts`, and it stays there.** `check:pick`
+   sweeps ~600k rays at it with no browser at all, because each ray costs a
+   microsecond instead of a pointer move plus a settled frame. Keeping
+   `surfaceDistance`/`firstUnoccluded` inline in the component made them testable
+   only through the UI, which is why the browser gate took 25+ minutes and could
+   only afford a few hundred samples.
+
+   The gate's oracle is deliberately *not* a second raycast: it solves where the ray
+   meets the sphere, converts to lat/lng, and runs point-in-polygon on the GeoJSON.
+   Asserting a raycast against a raycast proves nothing.
+
+   Two traps in that oracle, both of which look exactly like the picking rule being
+   catastrophically broken:
+   - `toCartesian` uses `theta = 90 - lng`, so the inverse is `90 - atan2(z, x)`.
+     Forgetting the 90° rotates the oracle a quarter-turn off the caps.
+   - three-globe swaps x and z relative to the textbook spherical convention, so
+     both the camera position and the surface normal are derived from
+     `toCartesian` itself. `setFromSphericalCoords` and a hand-written normal both
+     land in the other convention.
+
+   Limb rays (incidence < `MIN_INCIDENCE`) are counted and reported, not asserted:
+   the caps are a lifted shell whose silhouette does not line up with the sphere's,
+   so a surface point solved from a grazing ray legitimately disagrees about which
+   sliver of which country is under the pixel. Rays that miss the planet are never
+   asserted silent either — a sliver of every near-limb country is correctly
+   visible against the sky, which is what the `Infinity` in `surfaceDistance` is for.
+
 Re-picks are driven by the canvas pointer *and* by the controls' `change` event.
 Camera movement (inertia, zoom, auto-rotation, the flight to a selection) never
 moves the pointer, so a pointer-only listener leaves the header naming a country
@@ -91,6 +120,36 @@ The IFrame API's volume is **0–100**. `setVolume(0.8)` is 0.8%, not 80%; that 
 the "player is inaudible" bug. `DEFAULT_VOLUME = 100`, and `syncAudio()` re-asserts
 mute/volume on every player state change, because Chrome and Safari block audible
 autoplay and YouTube responds by starting muted and *staying* that way.
+
+The scrubber's fill and buffered bars are driven by direct DOM writes, never by
+React state — eight re-renders a second to move a bar is what makes a player feel
+cheap. But they must **not** also carry a Tailwind `scale-*` class: in v4 that
+compiles to the standalone `scale` property, which *composes* with an inline
+`transform` instead of being replaced by it, so `scale-x-0` held both bars at zero
+width while the time label, `aria-valuetext` and click-to-seek all carried on
+working — a progress bar that silently rendered nothing. v3 wrote both to
+`transform`, so this only broke on the v4 upgrade. Set the initial `scaleX(0)`
+inline and leave the scale utilities off these elements.
+
+The MacBook transport keys (F7/F8/F9, Touch Bar, Control Centre) arrive as **Media
+Session actions, not `keydown` events**. Nothing about them works until the page
+installs `navigator.mediaSession` handlers and sets `metadata` — which is why they
+did nothing at all. Register the handlers once and read `toggle`/`step` through a
+ref, or they get re-registered on every track change.
+
+## Layout
+
+The chart panel is full-height on the right at `sm` and above, so anything else
+pinned to the bottom-left must be capped at its left edge. The region rail was
+pinned to `sm:left-5` with no right bound, which put its last four chips *under*
+the panel — and because the panel is a later sibling with a higher `z-index`, those
+chips were not merely covered but unclickable: `elementFromPoint` over them
+returned the chart's metadata line. Any viewport narrower than about 1128px with a
+country selected hit this.
+
+Verify clickability with a real `page.mouse.click` at the element's coordinates, not
+`element.click()` in `evaluate` — the latter dispatches straight at the element and
+bypasses hit-testing entirely, so it happily "passes" a button no pointer can reach.
 
 ## Map layers
 

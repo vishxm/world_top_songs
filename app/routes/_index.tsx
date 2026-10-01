@@ -313,21 +313,34 @@ useEffect(() => {
         onTheme={setTheme}
       />
 
-      {/* Region rail. Sits in the flow between the stage and the sheet (or the
-          stage and the viewport bottom when no sheet is open), so it can never
-          overlap the globe or the panel at any viewport size. */}
+      {/* Region rail.
+          Narrow: it sits in the gap between the globe stage and the sheet, so it
+          cannot collide with either.
+          Wide: the panel is full-height on the right, so the rail is capped at the
+          panel's left edge. It used to be pinned to `sm:left-5` with no right
+          bound, which put the last four chips underneath the panel — and the panel
+          is a later sibling with a higher z-index, so those chips were not merely
+          covered, they were unclickable: `elementFromPoint` over Europe, Oceania
+          and Polar returned the chart's metadata line, not the button. Any viewport
+          narrower than roughly 1128px with a country selected hit this, which is
+          most laptops and every tablet.
+
+          `z-30` for the same reason against the hint below. The rail wraps to as
+          many rows as it needs, and a three-row rail on a phone grows straight up
+          into the hint's band; both are `pointer-events-auto`, so at equal z-index
+          the later sibling in the DOM wins and eats the chips' clicks. */}
       <div
-        className={`pointer-events-none absolute inset-x-0 z-20 flex justify-center px-3 sm:inset-x-auto sm:left-5 sm:px-0 ${
-          selected ? "bottom-[calc(48vh+1.25rem)] sm:bottom-5" : "bottom-3 sm:bottom-5"
-        }`}
+        className={`pointer-events-none absolute inset-x-0 z-30 flex justify-center px-3 sm:left-5 sm:px-0 ${
+          selected || playerActive ? "sm:right-[26.5rem]" : "sm:right-5"
+        } ${selected ? "bottom-[calc(48vh+1.25rem)] sm:bottom-5" : "bottom-3 sm:bottom-5"}`}
       >
         <RegionRail countries={countries} region={regionFilter} onRegion={setRegionFilter} />
       </div>
 
-      {/* Hint. On narrow the rail already occupies the band above the sheet, so
-          the hint overlays the globe instead and fades with the vignette. */}
+      {/* Hint. Sits clear above the rail, which is bottom-anchored and grows upward
+          as it wraps — an offset that cleared one row does not clear three. */}
       {showHint ? (
-        <div className="pointer-events-none absolute inset-x-0 bottom-[calc(48vh+4rem)] z-20 flex justify-center px-3 sm:inset-x-auto sm:bottom-20 sm:left-5 sm:justify-start sm:px-0">
+        <div className="pointer-events-none absolute inset-x-0 bottom-[calc(48vh+8.5rem)] z-20 flex justify-center px-3 sm:inset-x-auto sm:bottom-20 sm:left-5 sm:justify-start sm:px-0">
           <p
             className="glass pointer-events-auto w-fit max-w-[min(34rem,100%)] rounded-xl px-3.5 py-2 text-[12px] text-muted motion-safe:animate-rise"
             onClick={dismissHint}
