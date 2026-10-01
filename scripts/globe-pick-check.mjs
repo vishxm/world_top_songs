@@ -460,6 +460,72 @@ check(
   `${before} -> ${after}`
 );
 
+// ---------------------------------------------------------------------------
+// 8. The palette switcher. All four must stay reachable and each must actually
+//    repaint the globe — a swatch that renders but silently does nothing is the
+//    same class of dead control as the rail chips were.
+// ---------------------------------------------------------------------------
+stage("checking palette switcher");
+const palette = await page.evaluate(async () => {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const datumOf = (o) => {
+    while (o) {
+      const d = o.__data && o.__data.data;
+      if (d && d.iso) return d;
+      o = o.parent;
+    }
+    return null;
+  };
+  // Read the SELECTED country's cap, resolved from the URL rather than hardcoded:
+  // earlier checks move the selection around, so a fixed ISO would quietly end up
+  // reporting base cap colours and the check would pass while proving less.
+  const selectedIso = new URLSearchParams(location.search).get("c");
+  const selHex = () => {
+    let out = null;
+    window.__globe.scene().traverse((o) => {
+      if (out || o.__globeObjType !== "polygon") return;
+      if (datumOf(o)?.iso !== selectedIso) return;
+      const m = Array.isArray(o.children[0].material) ? o.children[0].material[1] : null;
+      if (m) out = m.color.getHexString();
+    });
+    return out;
+  };
+  const radios = Array.from(document.querySelectorAll('[role="radio"]'));
+  const results = [];
+  for (const r of radios) {
+    const id = r.dataset.swatch;
+    r.click();
+    await sleep(900);
+    results.push({
+      id,
+      theme: document.documentElement.dataset.theme,
+      checked: r.getAttribute("aria-checked"),
+      label: r.getAttribute("aria-label"),
+      globeHex: selHex(),
+    });
+  }
+  return {
+    results,
+    count: radios.length,
+    group: !!document.querySelector('[role="radiogroup"][aria-label]'),
+    // A radiogroup is one tab stop: only the checked radio may be tabbable.
+    tabbable: radios.filter((r) => r.tabIndex === 0).length,
+    checkedCount: radios.filter((r) => r.getAttribute("aria-checked") === "true").length,
+  };
+});
+const distinct = new Set(palette.results.map((r) => r.globeHex));
+check(
+  "all four palettes are offered and each repaints the globe",
+  palette.count === 4 &&
+    palette.group &&
+    palette.tabbable === 1 &&
+    palette.checkedCount === 1 &&
+    distinct.size === 4 &&
+    palette.results.every((r) => r.checked === "true"),
+  `${palette.count} swatches, ${distinct.size} distinct globe fills, ${palette.tabbable} tab stop, ${palette.checkedCount} checked — ` +
+    palette.results.map((r) => `${r.id}:${r.globeHex}`).join(" ")
+);
+
 check("no page errors", pageErrors.length === 0, pageErrors.slice(0, 3).join(" | "));
 
 await browser.close();

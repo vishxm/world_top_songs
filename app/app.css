@@ -119,6 +119,40 @@
 
 /* --- alternative directions, switchable at runtime via <html data-theme> --- */
 
+/* Palette swatches. Scoped by `data-swatch`, NOT by the active theme: a swatch has
+   to preview the palette it represents, so it cannot inherit the tokens of whatever
+   is currently applied. Two stops each — the palette's accent and its land colour —
+   so the four read as four distinct moods at a glance. Keep these in step with the
+   `--globe-cap-selected` / `--globe-cap` values in the blocks below. */
+[data-swatch] {
+  background: linear-gradient(135deg, var(--swatch-from) 0%, var(--swatch-to) 100%);
+  box-shadow: 0 0 0 1px rgb(0 0 0 / 0.35) inset;
+}
+[data-swatch="mission"] {
+  --swatch-from: #ffd67c;
+  --swatch-to: #96b4de;
+}
+[data-swatch="analog"] {
+  --swatch-from: #ff7a48;
+  --swatch-to: #d4552f;
+}
+[data-swatch="daylight"] {
+  --swatch-from: #2d6ef5;
+  --swatch-to: #c6d4ea;
+}
+[data-swatch="observatory"] {
+  --swatch-from: #67e8f9;
+  --swatch-to: #22d3ee;
+}
+/* The active swatch gets a ring in the live accent, so "which one am I on" is
+   answered by the theme itself rather than by a separate legend. */
+[data-swatch][data-active] {
+  box-shadow:
+    0 0 0 1px rgb(0 0 0 / 0.35) inset,
+    0 0 0 2px var(--color-void),
+    0 0 0 4px var(--color-accent);
+}
+
 /* Warm analog: paper, oxblood, ink. */
 [data-theme="analog"] {
   --globe-cap: rgba(212, 85, 47, 0.16);

@@ -1,7 +1,8 @@
-import { Dices, Moon, Sun } from "lucide-react";
-import { THEMES, type ThemeId } from "~/hooks/useTheme";
+import { Dices } from "lucide-react";
+import type { ThemeId } from "~/hooks/useTheme";
 import type { StageCountry } from "./GlobeView";
 import CountryPicker from "./CountryPicker";
+import PaletteSwitcher from "./PaletteSwitcher";
 import { IconButton } from "./ui";
 
 interface Props {
@@ -14,10 +15,6 @@ interface Props {
   onTheme: (t: ThemeId) => void;
 }
 
-/** Cycle through the four palette directions. Each one is a token override in
- *  app.css, so this swaps colours rather than swapping components. */
-const THEME_ORDER = THEMES.map((t) => t.id);
-
 export default function Header({
   countries,
   hovered,
@@ -27,9 +24,6 @@ export default function Header({
   onSurprise,
   onTheme,
 }: Props) {
-  const next = THEME_ORDER[(THEME_ORDER.indexOf(theme) + 1) % THEME_ORDER.length];
-  const nextLabel = THEMES.find((t) => t.id === next)?.label ?? next;
-
   // On wide layouts the chart rail occupies the right edge, so the header keeps
   // its controls clear of it rather than sitting underneath the panel.
   return (
@@ -74,9 +68,7 @@ export default function Header({
         <IconButton label="Surprise me" onClick={onSurprise}>
           <Dices className="h-4 w-4" />
         </IconButton>
-        <IconButton label={`Theme: ${nextLabel}`} onClick={() => onTheme(next)}>
-          {theme === "daylight" ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
-        </IconButton>
+        <PaletteSwitcher theme={theme} onTheme={onTheme} />
       </div>
     </header>
   );
