@@ -38,7 +38,9 @@
        - hover must read as a different colour from selection, not just a
          different opacity, since hover no longer lifts the cap. */
   --globe-cap: rgba(150, 180, 222, 0.16);
-  --globe-cap-dim: rgba(125, 154, 196, 0.03);
+  /* Dimmed is a ghost, not a blackout. At 0.03 the filtered-out land vanished
+     and the globe read as a broken render rather than as a filter. */
+  --globe-cap-dim: rgba(125, 154, 196, 0.075);
   --globe-cap-hover: rgba(190, 214, 245, 0.34);
   --globe-cap-selected: rgba(255, 205, 120, 0.6);
   /* Border is the only thing separating adjacent countries on a night-side
@@ -116,7 +118,7 @@
 /* Warm analog: paper, oxblood, ink. */
 [data-theme="analog"] {
   --globe-cap: rgba(212, 85, 47, 0.16);
-  --globe-cap-dim: rgba(212, 85, 47, 0.04);
+  --globe-cap-dim: rgba(212, 85, 47, 0.085);
   /* Pale paper-warm for hover, saturated oxblood for the selection: the two
      must not be the same hue at different alphas. */
   --globe-cap-hover: rgba(248, 219, 191, 0.36);
@@ -141,7 +143,7 @@
 /* Bright cartographic: daylight paper, navy landmasses. */
 [data-theme="daylight"] {
   --globe-cap: rgba(120, 150, 210, 0.14);
-  --globe-cap-dim: rgba(120, 150, 210, 0.03);
+  --globe-cap-dim: rgba(120, 150, 210, 0.07);
   /* Pale slate for hover against saturated navy for the selection — the paper
      UI is light but the globe is still the night texture, so the caps have to
      sit light-on-dark too. */
@@ -168,7 +170,7 @@
 /* Deep space observatory: colder, monospace-leaning, colder accent. */
 [data-theme="observatory"] {
   --globe-cap: rgba(34, 211, 238, 0.13);
-  --globe-cap-dim: rgba(34, 211, 238, 0.03);
+  --globe-cap-dim: rgba(34, 211, 238, 0.07);
   --globe-cap-hover: rgba(190, 238, 250, 0.34);
   --globe-cap-selected: rgba(34, 211, 238, 0.52);
   /* The limb here is almost black, so the border has to be a genuinely bright

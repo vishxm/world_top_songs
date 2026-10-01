@@ -11,7 +11,7 @@ React Router 7 (framework mode) + Vite 8 + React 19. Routes live in `app/routes/
 - Checks: `npm run typecheck` (typegen + tsc) and `npm run build`.
 - Dev server: `npm run dev` (binds `--host` for LAN testing).
 
-## The globe: four rules you must not break
+## The globe: five rules you must not break
 
 These each cost real debugging time. All are enforced by
 `npm run check:globe` (`scripts/globe-pick-check.mjs`).
@@ -55,6 +55,23 @@ These each cost real debugging time. All are enforced by
    country bleeds over its neighbours and captures the cursor from them. Only the
    selection lifts (`CAP_SELECTED`); hover is signalled by colour alone, so the two
    states must differ in hue, not just opacity.
+
+5. **Every input that changes the cap styling must be a repaint dependency.** All
+   styling funnels through `applyHoverVisuals()`, and the effect that calls it
+   lists `selectedIso` explicitly. It used to list only its own callback, so the
+   repaint fired when the *hover* changed and at no other time. Selecting from the
+   ⌘K palette, the region rail, Surprise me or the back button left the previous
+   country lit and the new one unlit until the pointer next moved — the pointer
+   being off the canvas is precisely the case that had no repaint. `hoverIso` is
+   deliberately *not* a dependency: hover is applied synchronously inside the
+   pointer handler so the cap is correct before the next pick reads geometry.
+
+   The region filter has to be handled in `applyHoverVisuals` as well as in
+   `getCapColor`, because `getCapColor` only runs inside a re-digest and changing
+   the region alters no polygon prop's identity, so it never re-digests. Colour
+   precedence is selection, then hover, then in/out of region; the lift marks the
+   selection independently, so a selected country outside the active region stays
+   findable.
 
 Re-picks are driven by the canvas pointer *and* by the controls' `change` event.
 Camera movement (inertia, zoom, auto-rotation, the flight to a selection) never

@@ -371,16 +371,18 @@ export default function GlobeView({
     scene.traverse((obj: unknown) => {
       const g = obj as {
         __globeObjType?: string;
-        __data?: { data?: { iso?: string } };
+        __data?: { data?: { iso?: string; region?: Region } };
         children?: { scale?: { setScalar: (n: number) => void }; material?: unknown }[];
       };
       if (g.__globeObjType !== "polygon") return;
-      const iso = g.__data?.data?.iso;
+      const datum = g.__data?.data;
+      const iso = datum?.iso;
       if (typeof iso !== "string") return;
 
       const isSelected = iso === selected;
       const isHovered = iso === hovered;
-      // Hover deliberately keeps the base altitude — see the note on CAP_BASE.
+      // The lift marks the selection and is independent of the region filter, so
+      // a selected country outside the current region stays findable.
       const lift = isSelected ? CAP_SELECTED : CAP_BASE;
       const scale = 1 + lift;
 
@@ -393,6 +395,18 @@ export default function GlobeView({
       // Cap material is index 1; index 0 is the side wall. three-globe makes a
       // fresh material per polygon, so writing it here is safe and avoids
       // re-digesting every polygon just to change one colour.
+      //
+      // The region filter is applied HERE as well as in `getCapColor`, and that
+      // duplication is the point: `getCapColor` only runs inside a re-digest, and
+      // changing the region alters no polygon prop's identity, so it never fires
+      // — the rail dimmed nothing, and the caps quietly painted themselves back
+      // to full strength on the next hover.
+      //
+      // Precedence is selection, then hover, then the filter. The selection
+      // outranking hover keeps the one country you are reading visibly amber
+      // instead of turning pale under your own cursor; the lift above covers the
+      // "is this still selected?" question either way.
+      const inRegion = !regionFilter || datum?.region === regionFilter;
       const mat = cap?.material;
       if (Array.isArray(mat)) {
         const m = mat[1] as
@@ -400,7 +414,13 @@ export default function GlobeView({
           | undefined;
         if (m?.color) {
           const rgba = parseRgba(
-            isSelected ? palette.capSelected : isHovered ? palette.capHover : palette.cap
+            isSelected
+              ? palette.capSelected
+              : isHovered
+                ? palette.capHover
+                : inRegion
+                  ? palette.cap
+                  : palette.capDim
           );
           if (rgba) {
             m.color.setHex(rgba[0]);
@@ -410,17 +430,27 @@ export default function GlobeView({
         }
       }
     });
-  }, [palette]);
+  }, [palette, regionFilter]);
 
-  /** Repaint when the *selection* changes. Hover is handled synchronously in
-   *  the pointer handler; it must not also run here or the two would fight. */
+  /**
+   * Repaint whenever the *selection* or the *region filter* changes, and once
+   * more shortly after mount because three-globe builds the caps asynchronously.
+   *
+   * Hover is deliberately absent: it is applied synchronously inside the pointer
+   * handler, so the cap under the cursor is already correct before the next pick
+   * reads geometry. Listing it here too would only duplicate the work.
+   *
+   * `selectedIso` has to be a dependency. Hover only ever repaints when the
+   * pointer happens to be over the globe, so selecting from the ⌘K palette, the
+   * region rail, Surprise me or the back button left the *previous* country lit
+   * up and the new one unlit — the highlight only corrected itself when the
+   * pointer next moved.
+   */
   useEffect(() => {
     applyHoverVisuals();
-    // three-globe builds the polygon objects asynchronously, so repaint once more
-    // shortly after mount in case the layer was not ready on the first pass.
     const retry = setTimeout(applyHoverVisuals, 400);
     return () => clearTimeout(retry);
-  }, [applyHoverVisuals]);
+  }, [applyHoverVisuals, selectedIso]);
 
   // Borders own the outline; three-globe's per-country strokes would cost a draw
   // call each and duplicate what the merged layer already draws crisply.
