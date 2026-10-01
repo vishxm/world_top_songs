@@ -151,6 +151,40 @@ Verify clickability with a real `page.mouse.click` at the element's coordinates,
 `element.click()` in `evaluate` — the latter dispatches straight at the element and
 bypasses hit-testing entirely, so it happily "passes" a button no pointer can reach.
 
+### The sheet folds on narrow layouts, and the globe's framing follows it
+
+Below `sm` the chart is a bottom sheet covering half the screen, so seeing the globe
+meant closing the chart and losing the selection. It now *folds* instead, to a peek
+bar: via the chevron in the panel header, via a tap on the globe that hits no
+country (`onEmptyTap` — a tap that already had nothing else to do), and back open
+from the peek bar. Folding is not closing: `?c=` stays, the ring stays on the globe,
+and the audio keeps playing. Wide layouts have a rail rather than a sheet, so
+`setFolded` short-circuits on `isWide` and the chevron is not rendered at all.
+
+`sheetReserve` in `_index.tsx` is the sheet's height in px, and it is the *only*
+number the globe offset, the camera altitude and the chrome offsets are derived
+from — the rail and the hint read it back out of a `--sheet-h` custom property on
+`<main>`, because `bottom-[calc(48vh+1.25rem)]` is simply the wrong number once the
+sheet can be 56px tall, and Tailwind cannot compute one class from another. Two
+consequences worth keeping:
+
+- **With nothing selected it still reserves the full `48vh`.** No sheet is on
+  screen, but the globe and the hint are framed against that reservation, so
+  collapsing it to the peek bar silently moved both on a first visit before the
+  bootstrap had picked a country.
+- **`globeOffset` is gone, replaced by an imperative tween.** As a prop,
+  three-globe applies it on the frame it changes, which turned a fold into a ~200px
+  jump; and because the route re-renders on every globe hover, a fresh array each
+  time re-wrote the camera's view offset on every pointer move. `offset` is
+  memoised and `GlobeView` eases `camera.setViewOffset` over `OFFSET_TWEEN_MS`.
+  The *first* write is not a move and must not be tweened: the camera has simply
+  never been offset, so tweening out of that start slides the globe across the
+  screen on every load, and skipping the write leaves it centred under the panel.
+
+A tap that hits a country always unfolds, on every path — globe, palette and Surprise
+me all go through `select`. Left folded, that tap lights the country up and appears
+to do nothing, because the list it asked for is hidden.
+
 ## Map layers
 
 The globe draws two layers, both generated — never hand-edit them:

@@ -74,6 +74,11 @@ const BORDER_ALTITUDE = 0.002;
 const IDLE_SPIN_DELAY_MS = 5200;
 const IDLE_SPIN_SPEED = 0.28;
 
+/** Duration of the screen-space offset tween. Long enough to read as the globe
+ *  being re-framed rather than teleported, short enough that the sheet is
+ *  already settled when it lands. */
+const OFFSET_TWEEN_MS = 420;
+
 /** "rgba(r, g, b, a)" -> [0xrrggbb, alpha]. Null for anything unparseable. */
 function parseRgba(colour: string): [number, number] | null {
   const m = /^rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)(?:[,/\s]+([\d.]+))?\s*\)$/.exec(colour.trim());
@@ -173,6 +178,15 @@ interface Props {
   palette: ThemeTokens["globe"];
   onHover: (c: StageCountry | null) => void;
   onSelect: (c: StageCountry) => void;
+  /**
+   * A tap that landed on the globe but hit no country — ocean, sky, or the space
+   * around the planet. On narrow layouts the route uses this to fold the chart
+   * sheet away, so the globe can be seen without deselecting the country.
+   *
+   * Fires on `pointerup` only when the press was not a drag, so spinning the globe
+   * never folds anything. Undefined on wide layouts, where there is no sheet.
+   */
+  onEmptyTap?: () => void;
 }
 
 export default function GlobeView({
@@ -187,6 +201,7 @@ export default function GlobeView({
   palette,
   onHover,
   onSelect,
+  onEmptyTap,
 }: Props) {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const globeRef = useRef<any>(null);
@@ -203,6 +218,11 @@ export default function GlobeView({
   selectedIsoRef.current = selectedIso;
   /** Mirrors `hoverIso`, written synchronously by the pick loop. */
   const hoverIsoRef = useRef<string | null>(hoverIso);
+  /** Mirrors `onEmptyTap` so the pointer listeners — registered once, when the
+   *  scene becomes ready — never have to be torn down and rebuilt because the
+   *  route handed down a new closure. */
+  const onEmptyTapRef = useRef(onEmptyTap);
+  onEmptyTapRef.current = onEmptyTap;
   /** Raycast plumbing, built once the canvas exists. */
   const picker = useRef<{
     el: HTMLCanvasElement;
@@ -312,6 +332,73 @@ export default function GlobeView({
       reducedMotion ? 0 : 1150
     );
   }, [focus, sceneReady, reducedMotion]);
+
+  /**
+   * Screen-space offset, EASED rather than applied.
+   *
+   * `globeOffset` is a prop, so three-globe re-applies it on the frame it changes
+   * — a sheet that collapses is a ~200px jump in one frame, and the globe tears
+   * across the screen instead of settling into the space it just gained. The
+   * altitude half of the same move is already tweened by `pointOfView`; this
+   * makes the offset half match it.
+   *
+   * Driven imperatively on `camera.setViewOffset` rather than through the prop,
+   * because the prop carries a single frame's value and there is no way to hand it
+   * a tween. Each frame overwrites the last, and nothing else touches the view
+   * offset — three-globe only clears it when the `globeOffset` prop changes, and
+   * that prop is no longer passed. `easeOutCubic` matches `pointOfView`'s feel.
+   */
+  const offsetShown = useRef<[number, number]>(offset);
+  const offsetRaf = useRef(0);
+  /** Whether the camera has been written to at all yet. */
+  const offsetPrimed = useRef(false);
+  useEffect(() => {
+    const camera = globeRef.current?.camera?.();
+    if (!camera) return;
+
+    const w = Math.max(1, dimensions.w);
+    const h = Math.max(1, dimensions.h);
+    const write = ([x, y]: [number, number]) => {
+      if (x === 0 && y === 0) camera.clearViewOffset();
+      else camera.setViewOffset(w, h, -x, -y, w, h);
+    };
+
+    const from = offsetShown.current;
+    const to = offset;
+    const moved = from[0] !== to[0] || from[1] !== to[1];
+    if (offsetRaf.current) cancelAnimationFrame(offsetRaf.current);
+
+    // The first write is not a move — the camera simply has never been offset, so
+    // there is nothing to travel from. Tweening out of an un-offset start slides
+    // the globe across the screen on every load, and skipping the write entirely
+    // leaves it centred under the panel. Reduced motion takes the same path, and
+    // so does an unchanged offset on a resize, which still needs re-writing
+    // against the new canvas size.
+    if (reducedMotion || !offsetPrimed.current || !moved) {
+      offsetPrimed.current = true;
+      offsetShown.current = to;
+      write(to);
+      return;
+    }
+
+    const started = performance.now();
+    const step = () => {
+      const k = Math.min(1, (performance.now() - started) / OFFSET_TWEEN_MS);
+      const e = 1 - Math.pow(1 - k, 3);
+      const next: [number, number] = [
+        from[0] + (to[0] - from[0]) * e,
+        from[1] + (to[1] - from[1]) * e,
+      ];
+      offsetShown.current = next;
+      write(next);
+      if (k < 1) offsetRaf.current = requestAnimationFrame(step);
+    };
+    offsetRaf.current = requestAnimationFrame(step);
+
+    return () => {
+      if (offsetRaf.current) cancelAnimationFrame(offsetRaf.current);
+    };
+  }, [offset, sceneReady, reducedMotion, dimensions]);
 
   // ------------------------------------------------------------ border layer
   // One LineSegments for every border in the map: a single draw call, full
@@ -690,6 +777,11 @@ export default function GlobeView({
       }
       const c = pickAt(e.clientX, e.clientY);
       if (c) onSelect(c);
+      // A tap that hit water or sky. Nothing was selected, so the pointer handler
+      // has nothing else to do with it — which makes it the natural place to let
+      // the route fold the sheet away. Only reached on a genuine tap, since the
+      // drag case returned above.
+      else onEmptyTapRef.current?.();
     };
     const onLeave = () => {
       pointer.current = null;
@@ -743,7 +835,6 @@ export default function GlobeView({
         ref={globeRef}
         width={dimensions.w}
         height={dimensions.h}
-        globeOffset={offset}
         globeImageUrl="/textures/earth-night.jpg"
         backgroundImageUrl="/textures/night-sky.png"
         backgroundColor="rgba(0,0,0,0)"

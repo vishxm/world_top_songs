@@ -1,5 +1,5 @@
 import { memo } from "react";
-import { AlertTriangle, Music, X } from "lucide-react";
+import { AlertTriangle, ChevronDown, Music, X } from "lucide-react";
 import type { ChartTrack, ChartWeek } from "~/lib/analyticsCharts";
 import type { Region } from "~/lib/countryMeta";
 import { isChartCountry } from "~/lib/countries";
@@ -50,6 +50,12 @@ interface Props {
   onPlay: (index: number) => void;
   onRetry: () => void;
   onClose: () => void;
+  /**
+   * Narrow layouts only. Collapses the sheet to its peek bar — the country stays
+   * selected, the audio keeps playing, the globe just gets the screen back. Wide
+   * layouts have a rail instead of a sheet, so this is not passed there.
+   */
+  onFold?: () => void;
 }
 
 // Memoized: the route re-renders on every globe hover, but nothing here depends
@@ -69,6 +75,7 @@ export default memo(function ChartPanel({
   onPlay,
   onRetry,
   onClose,
+  onFold,
 }: Props) {
   const chartCountry = isChartCountry(iso);
 
@@ -97,6 +104,17 @@ export default memo(function ChartPanel({
               >
                 {data.source === "stale" ? "cached" : "offline"}
               </Pill>
+            ) : null}
+            {onFold ? (
+              <button
+                type="button"
+                onClick={onFold}
+                aria-label="Collapse chart"
+                title="Collapse the chart and see the globe"
+                className="grid h-7 w-7 place-items-center rounded-lg text-faint transition hover:bg-raised hover:text-ink"
+              >
+                <ChevronDown className="h-4 w-4" />
+              </button>
             ) : null}
             <button
               type="button"
