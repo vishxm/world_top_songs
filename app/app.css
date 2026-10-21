@@ -63,6 +63,8 @@
   --text-title--line-height: 1.375rem;
   --text-display: 1.375rem; /* 22px — country name, wordmark */
   --text-display--line-height: 1.5rem;
+  --text-heading: 1.75rem; /* 28px — recovery screens only */
+  --text-heading--line-height: 2rem;
 
   /* Space and shape ------------------------------------------------------- */
   --spacing-gutter: 1.25rem; /* the one page inset on wide layouts */

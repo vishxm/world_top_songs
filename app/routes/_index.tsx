@@ -42,6 +42,8 @@ const PLAYER_ALLOWANCE_PX = 94;
 const HEADER_CLEARANCE = 118;
 const FOV_TAN = Math.tan((50 / 2) * (Math.PI / 180)); // three-globe's fixed 50° fov
 
+type RecoveryNotice = { message: string; iso: string };
+
 /**
  * Camera altitude (1 + distance/radius) that makes the globe fill `targetRadius`
  * pixels. Solved from the projection rather than hand-tuned, so it stays correct
@@ -107,6 +109,10 @@ export default function Home() {
   const [focus, setFocus] = useState<{ lat: number; lng: number; altitude: number; n: number } | null>(null);
   const [activeIndex, setActiveIndex] = useState<number | null>(null);
   const [viewportW, setViewportW] = useState(1440);
+  /** Set when a bad `?c=` was recovered to a real country, so the chart can
+   *  explain why the address changed. Tied to the fallback ISO so it cannot
+   *  outlive a later back/forward to another country. */
+  const [recoveryNotice, setRecoveryNotice] = useState<RecoveryNotice | null>(null);
 
   /**
    * Narrow layouts only: has the user folded the chart sheet away to the peek bar?
@@ -163,8 +169,10 @@ export default function Home() {
 
   // ---------------------------------------------------------------- routing
   // The URL is the source of truth for selection, so a country is shareable and
-  // the back button steps through history.
-  const selectedIso = params.get("c");
+  // the back button steps through history. Codes are case-insensitive on the way
+  // in; the URL is canonicalised to the map's ISO once the map has loaded.
+  const rawIso = params.get("c");
+  const requestedIso = rawIso?.trim() ? rawIso.trim().toUpperCase() : null;
   const kind: ChartKind = params.get("kind") === "videos" ? "videos" : "songs";
 
   const byIso = useMemo(() => {
@@ -173,10 +181,12 @@ export default function Home() {
     return m;
   }, [countries]);
 
-  const selected = selectedIso ? byIso.get(selectedIso) ?? null : null;
+  const selected = requestedIso ? byIso.get(requestedIso) ?? null : null;
+  const selectedIso = selected?.iso ?? null;
+  const recoveryMessage = recoveryNotice?.iso === selectedIso ? recoveryNotice.message : null;
 
   const patchParams = useCallback(
-    (next: { c?: string | null; kind?: ChartKind }) => {
+    (next: { c?: string | null; kind?: ChartKind }, opts?: { replace?: boolean }) => {
       setParams(
         (prev) => {
           const p = new URLSearchParams(prev);
@@ -185,7 +195,7 @@ export default function Home() {
           if (next.kind) p.set("kind", next.kind);
           return p;
         },
-        { replace: false }
+        { replace: opts?.replace ?? false }
       );
     },
     [setParams]
@@ -197,6 +207,7 @@ export default function Home() {
   const select = useCallback(
     (c: StageCountry) => {
       setStoredIso(c.iso);
+      setRecoveryNotice(null);
       patchParams({ c: c.iso });
       // Picking a country — by globe tap, the picker or Surprise me — is an
       // explicit request to read its chart, so a folded sheet comes back. Left
@@ -210,19 +221,62 @@ export default function Home() {
   const changeTab = useCallback((k: ChartKind) => patchParams({ kind: k }), [patchParams]);
 
   const closePanel = useCallback(() => {
+    setRecoveryNotice(null);
     patchParams({ c: null });
   }, [patchParams]);
 
   // First visit with no `?c`: land somewhere with a live chart rather than an
-  // empty stage. `replace` keeps this out of the history stack.
+  // empty stage. `replace` keeps this out of the history stack. A supplied
+  // `?c=` — even a blank one — goes through the recovery effects below instead,
+  // so a malformed link is explained rather than silently bootstrapped.
   const bootstrapped = useRef(false);
   useEffect(() => {
     if (bootstrapped.current || countries.length === 0) return;
     bootstrapped.current = true;
-    if (params.has("c")) return;
+    if (rawIso !== null) return;
     const iso = byIso.has(storedIso) ? storedIso : (CHART_ISOS.find((i) => byIso.has(i)) ?? "US");
     setParams(new URLSearchParams({ c: iso, kind }), { replace: true });
-  }, [countries.length, byIso, storedIso, params, setParams, kind]);
+  }, [countries.length, byIso, storedIso, rawIso, setParams, kind]);
+
+  // A known country written in lower case (or with stray spaces) is still the
+  // same selection. Rewrite the address bar to the canonical ISO with replace,
+  // so the sloppy spelling does not become a history entry.
+  useEffect(() => {
+    if (!selected) return;
+    if (rawIso === selected.iso) return;
+    patchParams({ c: selected.iso }, { replace: true });
+  }, [selected, rawIso, patchParams]);
+
+  // A bad `?c=` must not leave a bare globe. Once the map is available, fall
+  // back to the last valid country (or the first charted one), stay on the same
+  // history entry, and tell the chart why the address changed. A blank `?c=`
+  // is a bad link too; no `c` at all is an intentional empty stage.
+  useEffect(() => {
+    if (mapLoading || countries.length === 0 || selected) return;
+    if (rawIso === null) return;
+    const iso = byIso.has(storedIso) ? storedIso : (CHART_ISOS.find((i) => byIso.has(i)) ?? null);
+    const fallback = iso ? (byIso.get(iso) ?? null) : null;
+    if (!fallback) return;
+    // The notice lives in the chart panel, so a folded sheet would hide the
+    // explanation. Recovery is a selection: bring the chart back.
+    setSheetFolded(false);
+    setRecoveryNotice({
+      iso: fallback.iso,
+      message: requestedIso
+        ? `We couldn’t find a country for “${requestedIso}”. Showing ${fallback.name} instead.`
+        : `That link didn’t name a country. Showing ${fallback.name} instead.`,
+    });
+    patchParams({ c: fallback.iso }, { replace: true });
+  }, [
+    mapLoading,
+    countries.length,
+    rawIso,
+    requestedIso,
+    selected,
+    byIso,
+    storedIso,
+    patchParams,
+  ]);
 
   const [isPlaying, setIsPlaying] = useState(false);
 
@@ -460,6 +514,7 @@ export default function Home() {
                   loading={loading}
                   error={error}
                   kind={kind}
+                  notice={recoveryMessage}
                   activeVideoId={activeVideoId}
                   isPlaying={isPlaying}
                   isPaused={activeVideoId != null && !isPlaying}

@@ -1,5 +1,14 @@
 import type { ReactNode } from "react";
-import { Links, Meta, Outlet, Scripts, ScrollRestoration } from "react-router";
+import {
+  Links,
+  Meta,
+  Outlet,
+  Scripts,
+  ScrollRestoration,
+  isRouteErrorResponse,
+  useRouteError,
+} from "react-router";
+import RecoveryScreen from "./components/RecoveryScreen";
 import "./app.css";
 
 export function links() {
@@ -55,5 +64,40 @@ export default function App() {
         </p>
       </noscript>
     </>
+  );
+}
+
+/**
+ * The root boundary catches every route module API and component error, so a
+ * render failure still lands on the app's own surface. It renders inside
+ * `Layout`, which supplies the document and the stylesheet.
+ */
+export function ErrorBoundary() {
+  const error = useRouteError();
+  const notFound = isRouteErrorResponse(error) && error.status === 404;
+
+  return (
+    <RecoveryScreen
+      eyebrow={notFound ? "Off the map · 404" : "Something went wrong"}
+      title={notFound ? "This page isn’t on the chart" : "The atlas slipped"}
+      actions={
+        <>
+          <a href="/" className="btn btn-primary">
+            Back to the globe
+          </a>
+          {!notFound ? (
+            <button type="button" onClick={() => window.location.reload()} className="btn btn-quiet">
+              Reload
+            </button>
+          ) : null}
+        </>
+      }
+    >
+      <p>
+        {notFound
+          ? "The address doesn’t match any page here. The globe is one tap away."
+          : "The globe hit an unexpected error. Reload to try again, or head back to the map."}
+      </p>
+    </RecoveryScreen>
   );
 }

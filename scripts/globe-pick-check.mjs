@@ -17,11 +17,16 @@
 //   5. the draw-call budget holds
 //   6. the player's progress bar renders (a Tailwind v4 regression, see NowPlaying)
 //   7. Media Session handlers are installed, so the MacBook transport keys land
+//   8. one calm theme, with no theme switcher or theme handoff
+//   9. back and forward restore the URL-selected country
+//  10. bad country codes recover with an explanation, and unknown routes land on
+//      the branded recovery screen
 //
 // Run it against a dev server. Usage: node scripts/globe-pick-check.mjs [url]
 import { chromium } from "playwright";
 
 const URL_ = process.argv[2] ?? "http://localhost:5173/?c=US";
+const BASE = new URL(URL_).origin;
 /** Pixels per axis step. Small on purpose — see SCOPE above. */
 const STEP = 97;
 /** How many land pixels must name a country. A smoke test, not a benchmark. */
@@ -508,8 +513,151 @@ check(
     `body ${themeState.bodyBg} (token ${themeState.expectedBg}), ink ${themeState.ink}, accent ${themeState.accent}`
 );
 
+// ---------------------------------------------------------------------------
+// 9. Back and forward are the other half of "the URL is the selection".
+// ---------------------------------------------------------------------------
+stage("checking back and forward");
+await page.goBack();
+await page.waitForFunction(
+  (iso) => new URLSearchParams(location.search).get("c") === iso,
+  startIso,
+  { timeout: 10_000 }
+);
+await page.waitForTimeout(1200);
+const backIso = await page.evaluate(() => new URLSearchParams(location.search).get("c"));
+const backCap = await capState(startIso);
+await page.goForward();
+await page.waitForFunction(
+  (iso) => new URLSearchParams(location.search).get("c") === iso,
+  selAfterPick,
+  { timeout: 10_000 }
+);
+await page.waitForTimeout(1200);
+const forwardIso = await page.evaluate(() => new URLSearchParams(location.search).get("c"));
+const forwardCap = await capState(selAfterPick);
+check(
+  "back and forward restore the selected country",
+  backIso === startIso &&
+    forwardIso === selAfterPick &&
+    !!backCap &&
+    backCap.opacity !== null &&
+    backCap.opacity > 0.5 &&
+    !!forwardCap &&
+    forwardCap.opacity !== null &&
+    forwardCap.opacity > 0.5,
+  `${startIso} <- back ${backIso}@${backCap?.opacity}, forward ${forwardIso}@${forwardCap?.opacity}`
+);
+
 check("no page errors", pageErrors.length === 0, pageErrors.slice(0, 3).join(" | "));
 
+// The page above has a live player attached; use a clean page for full-document
+// navigations so a media teardown cannot be mistaken for a routing error.
+await page.close();
+const routePage = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+const routeErrors = [];
+routePage.on("pageerror", (e) => routeErrors.push(String(e)));
+routePage.on("console", (m) => {
+  if (m.type() === "error") routeErrors.push(m.text().slice(0, 160));
+});
+
+// ---------------------------------------------------------------------------
+// 10. Bad links must land somewhere real and explain themselves. Unknown paths
+//     must never fall through to the globe.
+// ---------------------------------------------------------------------------
+stage("checking bad country codes and the 404 route");
+const readRouteState = () =>
+  routePage.evaluate(() => ({
+    c: new URLSearchParams(location.search).get("c"),
+    notice:
+      document.querySelector('section[aria-label$="chart"] [role="status"]')?.textContent?.trim() ?? null,
+    panel: !!document.querySelector('section[aria-label$="chart"]'),
+    globe: !!window.__globe,
+    heading: document.querySelector("h1")?.textContent?.trim() ?? null,
+    home: !!Array.from(document.querySelectorAll("a")).find((a) =>
+      a.textContent?.includes("Back to the globe")
+    ),
+  }));
+
+await routePage.goto(`${BASE}/?c=ZZ`, { waitUntil: "networkidle" });
+await routePage.waitForFunction(() => !!window.__globe, null, { timeout: 30_000 });
+await routePage.waitForFunction(
+  () => {
+    const c = new URLSearchParams(location.search).get("c");
+    return !!c && c !== "ZZ";
+  },
+  null,
+  { timeout: 10_000 }
+);
+await routePage.waitForTimeout(800);
+const invalid = await readRouteState();
+check(
+  "invalid country code recovers with an explanation",
+  !!invalid.c &&
+    /^[A-Z]{2}$/.test(invalid.c) &&
+    !!invalid.notice &&
+    invalid.notice.includes("ZZ") &&
+    /showing/i.test(invalid.notice) &&
+    invalid.panel &&
+    invalid.globe,
+  `${invalid.c}: ${invalid.notice}`
+);
+
+await routePage.goto(`${BASE}/?c=`, { waitUntil: "networkidle" });
+await routePage.waitForFunction(() => !!window.__globe, null, { timeout: 30_000 });
+await routePage.waitForFunction(() => !!new URLSearchParams(location.search).get("c"), null, {
+  timeout: 10_000,
+});
+await routePage.waitForTimeout(800);
+const blank = await readRouteState();
+check(
+  "blank country code recovers with an explanation",
+  !!blank.c &&
+    /^[A-Z]{2}$/.test(blank.c) &&
+    !!blank.notice &&
+    /didn.t name a country/i.test(blank.notice) &&
+    blank.panel &&
+    blank.globe,
+  `${blank.c}: ${blank.notice}`
+);
+
+await routePage.goto(`${BASE}/?c=us`, { waitUntil: "networkidle" });
+await routePage.waitForFunction(
+  () => new URLSearchParams(location.search).get("c") === "US",
+  null,
+  { timeout: 10_000 }
+);
+await routePage.waitForTimeout(400);
+const canonical = await readRouteState();
+check(
+  "lower-case country code canonicalises and selects",
+  canonical.c === "US" && canonical.panel && canonical.globe,
+  `${canonical.c}, panel ${canonical.panel}`
+);
+
+await routePage.goto(`${BASE}/no-such-page`, { waitUntil: "networkidle" });
+await routePage.waitForTimeout(600);
+const notFoundState = await readRouteState();
+check(
+  "unknown route shows the branded recovery screen",
+  !notFoundState.globe &&
+    !!notFoundState.heading &&
+    notFoundState.heading.includes("on the chart") &&
+    notFoundState.home,
+  `${notFoundState.heading}, globe ${notFoundState.globe}, home link ${notFoundState.home}`
+);
+await routePage.getByRole("link", { name: "Back to the globe" }).click();
+await routePage.waitForFunction(() => !!window.__globe, null, { timeout: 30_000 });
+await routePage.waitForTimeout(800);
+const homeState = await readRouteState();
+check(
+  "the 404 recovery link returns home",
+  new URL(routePage.url()).pathname === "/" && !!homeState.c && homeState.globe,
+  routePage.url()
+);
+
+check("no routing page errors", routeErrors.length === 0, routeErrors.slice(0, 3).join(" | "));
+
+await routePage.close();
 await browser.close();
 
 const failed = results.filter((r) => !r.pass);

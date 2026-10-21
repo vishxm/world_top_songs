@@ -137,6 +137,32 @@ installs `navigator.mediaSession` handlers and sets `metadata` — which is why 
 did nothing at all. Register the handlers once and read `toggle`/`step` through a
 ref, or they get re-registered on every track change.
 
+## Routing and recovery
+
+The URL is the source of truth for selection. `?c=XX` holds the map ISO, user
+selections push a history entry, and back/forward re-derive the selection from
+the URL rather than keeping a second copy in state. A country tap therefore
+survives reload and is shareable.
+
+Not every URL is trustworthy, so there are three distinct cases:
+
+- **No `c` at all** is the intentional empty stage after `closePanel`. It must not
+  be auto-filled.
+- **No `c` on first load** bootstraps the stored country, then the first charted
+  country, with `replace` so the bootstrap does not become a history entry.
+- **`?c=` present but blank or unknown** is a bad link. Once the map is available
+  it recovers to the stored/first country with `replace` and shows an inline
+  notice in the chart panel. A bad URL must never leave a bare globe. Lower-case
+  and whitespace-padded codes are the same selection and are canonicalised in
+  place.
+
+Unknown routes are a catch-all `routes/not-found.tsx`, not the root boundary. The
+root `ErrorBoundary` in `root.tsx` catches render/loader/action failures. Both
+render `RecoveryScreen`; the root boundary sits inside `Layout`, so it must not
+render `<html>` or `<head>`. Full-document navigations in the browser gate use a
+clean page after the player tests, because a YouTube iframe teardown can log
+console noise that has nothing to do with routing.
+
 ## Layout
 
 The chart panel is full-height on the right at `sm` and above, so anything else

@@ -1,5 +1,5 @@
 import { memo } from "react";
-import { AlertTriangle, ChevronDown, Music, X } from "lucide-react";
+import { AlertTriangle, ChevronDown, Compass, Music, X } from "lucide-react";
 import type { ChartTrack, ChartWeek } from "~/lib/analyticsCharts";
 import type { Region } from "~/lib/countryMeta";
 import { isChartCountry } from "~/lib/countries";
@@ -41,6 +41,9 @@ interface Props {
   loading: boolean;
   error: string | null;
   kind: ChartKind;
+  /** A one-off explanation from the route, e.g. an invalid country code was
+   *  recovered to a real one. Cleared when the user makes a new selection. */
+  notice?: string | null;
   /** videoId of the playing track, or null. Not an index: the player's queue is
    *  independent of this list, so positions do not correspond. */
   activeVideoId: string | null;
@@ -68,6 +71,7 @@ export default memo(function ChartPanel({
   loading,
   error,
   kind,
+  notice,
   activeVideoId,
   isPlaying,
   isPaused,
@@ -118,6 +122,16 @@ export default memo(function ChartPanel({
         {!chartCountry ? (
           <p className="mt-3 rounded-control border border-line bg-raised/60 px-2.5 py-1.5 text-micro leading-snug text-muted">
             No dedicated chart here — showing Spotify&apos;s weekly list, resolved to playable videos.
+          </p>
+        ) : null}
+
+        {notice ? (
+          <p
+            role="status"
+            className="mt-3 flex items-start gap-2 rounded-control border border-accent/25 bg-accent/10 px-2.5 py-1.5 text-micro leading-snug text-muted"
+          >
+            <Compass className="mt-0.5 h-3 w-3 shrink-0 text-accent" aria-hidden />
+            <span>{notice}</span>
           </p>
         ) : null}
 
