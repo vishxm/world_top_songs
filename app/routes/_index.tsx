@@ -7,13 +7,13 @@ import type { ChartTrack } from "~/lib/analyticsCharts";
 import Header from "~/components/Header";
 import RegionRail from "~/components/RegionRail";
 import NowPlaying from "~/components/NowPlaying";
-import { CountryMark, EmptyState } from "~/components/ui";
-import { AlertTriangle, Compass } from "lucide-react";
+import { AtlasMark, EmptyState } from "~/components/ui";
+import { AlertTriangle } from "lucide-react";
 import { CHART_ISOS } from "~/lib/countries";
 import { loadBorderGeometry, loadCountryCaps } from "~/lib/mapData";
 import { useChart } from "~/hooks/useChart";
 import { useReducedMotion, useStoredState } from "~/hooks/usePrefs";
-import { useTheme, useThemeTokens } from "~/hooks/useTheme";
+import { useGlobePalette } from "~/hooks/useGlobePalette";
 import type { Region } from "~/lib/countryMeta";
 
 const PANEL_WIDTH = 384;
@@ -89,8 +89,7 @@ function altitudeForViewport(span: number, width: number, viewportH: number, she
 export default function Home() {
   const [params, setParams] = useSearchParams();
   const reducedMotion = useReducedMotion();
-  const { theme, setTheme } = useTheme();
-  const tokens = useThemeTokens(theme);
+  const palette = useGlobePalette();
   const [storedIso, setStoredIso] = useStoredState("wts.country", "US");
 
   // Measure once per layout change rather than tracking every scroll/resize:
@@ -108,7 +107,6 @@ export default function Home() {
   const [focus, setFocus] = useState<{ lat: number; lng: number; altitude: number; n: number } | null>(null);
   const [activeIndex, setActiveIndex] = useState<number | null>(null);
   const [viewportW, setViewportW] = useState(1440);
-  const [hintDone, setHintDone] = useStoredState("wts.hint", "");
 
   /**
    * Narrow layouts only: has the user folded the chart sheet away to the peek bar?
@@ -142,8 +140,8 @@ export default function Home() {
   }, []);
 
   // Only the breakpoint and the width matter, so snap the width to 100px steps
-// and ignore height-only changes (mobile browser chrome) entirely.
-useEffect(() => {
+  // and ignore height-only changes (mobile browser chrome) entirely.
+  useEffect(() => {
     let lastW = -1;
     let lastH = -1;
     const update = () => {
@@ -200,7 +198,7 @@ useEffect(() => {
     (c: StageCountry) => {
       setStoredIso(c.iso);
       patchParams({ c: c.iso });
-      // Picking a country — by globe tap, the palette or Surprise me — is an
+      // Picking a country — by globe tap, the picker or Surprise me — is an
       // explicit request to read its chart, so a folded sheet comes back. Left
       // folded, the tap would light the country up on the globe and appear to do
       // nothing at all, because the list it was asking for is hidden.
@@ -275,9 +273,9 @@ useEffect(() => {
         SHEET_PEEK_PX + (playerActive ? PLAYER_ALLOWANCE_PX : 0)
       : // Open, or nothing selected at all. The no-selection case deliberately
         // keeps reserving the full sheet: there is no sheet on screen then, but
-        // the globe and the hint are framed against that reservation, and
-        // collapsing it to a peek bar's worth would silently move both on a
-        // first visit before the bootstrap picks a country.
+        // the globe is framed against that reservation, and collapsing it to a
+        // peek bar's worth would silently move it on a first visit before the
+        // bootstrap picks a country.
         viewportRef.current.h * SHEET_FRACTION;
 
   // Memoised so its identity survives a re-render. The route re-renders on every
@@ -290,7 +288,7 @@ useEffect(() => {
   );
 
   // The camera follows the selection, whichever way it changed — globe click,
-  // palette, URL deep link, or the back button.
+  // picker, URL deep link, or the back button.
   //
   // Keyed on the reserved sheet height as well as the country, because folding the
   // sheet changes the clear band and the globe has to re-frame into it. Re-firing
@@ -341,9 +339,6 @@ useEffect(() => {
   const foldSheet = useCallback(() => setFolded(true), [setFolded]);
   const unfoldSheet = useCallback(() => setFolded(false), [setFolded]);
 
-  const showHint = !hintDone && countries.length > 0 && !mapLoading;
-  const dismissHint = useCallback(() => setHintDone("1"), [setHintDone]);
-
   if (mapError) {
     return (
       <main className="fixed inset-0 grid place-items-center bg-void px-6 text-ink">
@@ -355,7 +350,7 @@ useEffect(() => {
             <button
               type="button"
               onClick={() => window.location.reload()}
-              className="rounded-full bg-accent px-4 py-1.5 text-[12px] font-semibold text-accent-ink"
+              className="btn btn-primary"
             >
               Reload
             </button>
@@ -366,45 +361,47 @@ useEffect(() => {
   }
 
   return (
-    // `--sheet-h` is how the chrome above the sheet (the region rail, the hint)
-    // learns how tall the sheet currently is. It has to be a variable rather than
-    // the `48vh` literal that used to be repeated in those offsets: once the sheet
-    // can fold to a 56px peek bar, a hardcoded fraction is simply the wrong
-    // number, and Tailwind cannot compute one class from another class.
+    // `--sheet-h` is how the chrome above the sheet (the region rail) learns how
+    // tall the sheet currently is. It has to be a variable rather than the `48vh`
+    // literal that used to be repeated in those offsets: once the sheet can fold
+    // to a 56px peek bar, a hardcoded fraction is simply the wrong number, and
+    // Tailwind cannot compute one class from another class.
     <main
+      id="main"
       className="fixed inset-0 overflow-hidden bg-void text-ink"
       style={{ "--sheet-h": `${sheetReserve}px` } as CSSProperties}
     >
-      <GlobeView
-        countries={countries}
-        borders={borders}
-        selectedIso={selectedIso}
-        hoverIso={hovered?.iso ?? null}
-        focus={focus}
-        offset={offset}
-        reducedMotion={reducedMotion}
-        regionFilter={regionFilter}
-        palette={tokens.globe}
-        onHover={setHovered}
-        onSelect={select}
-        onEmptyTap={foldSheet}
-      />
+      {/* Globe stage. A named landmark so the canvas is not an anonymous
+          full-bleed div in the accessibility tree. */}
+      <section aria-label="World globe" className="absolute inset-0 z-0">
+        <GlobeView
+          countries={countries}
+          borders={borders}
+          selectedIso={selectedIso}
+          hoverIso={hovered?.iso ?? null}
+          focus={focus}
+          offset={offset}
+          reducedMotion={reducedMotion}
+          regionFilter={regionFilter}
+          palette={palette}
+          onHover={setHovered}
+          onSelect={select}
+          onEmptyTap={foldSheet}
+        />
+      </section>
 
-      {/* Vignette: pulls the eye to the globe and stops the star field from
-          fighting the panel text. Kept light — the globe is the subject. */}
-      <div
-        aria-hidden
-        className="pointer-events-none absolute inset-0 z-10 bg-[radial-gradient(115%_85%_at_38%_48%,transparent_45%,color-mix(in_oklab,var(--color-void)_82%,transparent)_100%)]"
-      />
+      {/* Vignette + scrim: settle the sphere into the page and keep header and
+          rail text legible over bright land. The globe is the subject; these
+          only remove the edge. */}
+      <div aria-hidden className="stage-vignette pointer-events-none absolute inset-0 z-10" />
+      <div aria-hidden className="stage-scrim pointer-events-none absolute inset-0 z-10" />
 
       <Header
         countries={countries}
         hovered={hovered}
         selectedIso={selectedIso}
-        theme={theme}
         onPick={select}
         onSurprise={surprise}
-        onTheme={setTheme}
       />
 
       {/* Region rail.
@@ -419,31 +416,18 @@ useEffect(() => {
           narrower than roughly 1128px with a country selected hit this, which is
           most laptops and every tablet.
 
-          `z-30` for the same reason against the hint below. The rail wraps to as
-          many rows as it needs, and a three-row rail on a phone grows straight up
-          into the hint's band; both are `pointer-events-auto`, so at equal z-index
-          the later sibling in the DOM wins and eats the chips' clicks. */}
+          `z-30` keeps it above the vignette, and the right bound keeps it clear of
+          the chart surface. The rail wraps to as many rows as it needs; it grows
+          upward from its bottom anchor, which is free. */}
       <div
-        className={`pointer-events-none absolute inset-x-0 z-30 flex justify-center px-3 sm:left-5 sm:px-0 ${
-          selected || playerActive ? "sm:right-[26.5rem]" : "sm:right-5"
-        } ${selected ? "bottom-[calc(var(--sheet-h)+1.25rem)] sm:bottom-5" : "bottom-3 sm:bottom-5"}`}
+        className={`pointer-events-none absolute inset-x-0 z-30 flex justify-center px-3 sm:left-gutter sm:px-0 ${
+          selected || playerActive ? "sm:right-[26.5rem]" : "sm:right-gutter"
+        } ${selected ? "bottom-[calc(var(--sheet-h)+1.25rem)] sm:bottom-gutter" : "bottom-3 sm:bottom-gutter"}`}
       >
-        <RegionRail countries={countries} region={regionFilter} onRegion={setRegionFilter} />
+        {countries.length > 0 ? (
+          <RegionRail countries={countries} region={regionFilter} onRegion={setRegionFilter} />
+        ) : null}
       </div>
-
-      {/* Hint. Sits clear above the rail, which is bottom-anchored and grows upward
-          as it wraps — an offset that cleared one row does not clear three. */}
-      {showHint ? (
-        <div className="pointer-events-none absolute inset-x-0 bottom-[calc(var(--sheet-h)+8.5rem)] z-20 flex justify-center px-3 sm:inset-x-auto sm:bottom-20 sm:left-5 sm:justify-start sm:px-0">
-          <p
-            className="glass pointer-events-auto w-fit max-w-[min(34rem,100%)] rounded-xl px-3.5 py-2 text-[12px] text-muted motion-safe:animate-rise"
-            onClick={dismissHint}
-          >
-            Drag the globe to spin it. Click any country to load its weekly Top 10 — or press{" "}
-            <kbd className="rounded border border-line px-1">⌘K</kbd> to pick from all {countries.length}.
-          </p>
-        </div>
-      ) : null}
 
       {/* Chart + player share one column so they can never overlap: the chart
           takes the flexible space and the player keeps its natural height at the
@@ -453,13 +437,12 @@ useEffect(() => {
           does not take the transport controls with it. */}
       {selected || playerActive ? (
         <aside
-          className={`fixed right-3 bottom-3 left-3 z-30 flex flex-col gap-2.5 sm:right-5 sm:bottom-5 sm:left-auto sm:w-[384px] ${
+          className={`fixed right-3 bottom-3 left-3 z-30 flex flex-col gap-2.5 sm:right-gutter sm:bottom-gutter sm:left-auto sm:w-[384px] ${
             selected
               ? sheetOpen
                 ? // Height is the variable, not `48vh`, so it matches `sheetReserve`
-                  // exactly — the rail, the hint and the globe all read the same
-                  // number that positions this box, and folding moves all four
-                  // together instead of three of them.
+                  // exactly — the rail and the globe read the same number that
+                  // positions this box, and folding moves them together.
                   "h-[var(--sheet-h)] sm:h-[calc(100vh-2.5rem)]"
                 : "h-auto"
               : ""
@@ -524,27 +507,29 @@ useEffect(() => {
           : ""}
       </p>
 
-      {/* Idle / empty stage affordance, also the loading state. */}
+      {/* The stage's own loading state. A static mark rather than a pulse: the
+          wait is short, and an animated ring competes with the globe it is
+          announcing. */}
       {!selected && (mapLoading || countries.length === 0) ? (
         <div className="pointer-events-none absolute inset-0 z-20 grid place-items-center">
-          <div className="flex flex-col items-center gap-3 text-center">
-            <span className="relative grid h-12 w-12 place-items-center">
-              <span className="absolute inset-0 animate-halo rounded-full border border-accent" />
-              <Compass className="h-5 w-5 text-accent" />
-            </span>
-            <p className="text-[12px] text-faint">Drawing the world…</p>
+          <div className="flex flex-col items-center gap-3 text-center motion-safe:animate-fade">
+            <AtlasMark className="h-8 w-8 text-accent" />
+            <p className="eyebrow">Loading the atlas</p>
           </div>
         </div>
       ) : null}
 
+      {/* Empty stage: a sentence in the middle of the sphere, not a floating
+          card. The globe remains the thing to touch. */}
       {!selected && countries.length > 0 && !mapLoading ? (
-        <div className="pointer-events-none absolute inset-x-0 top-1/2 left-1/2 z-20 hidden -translate-x-1/2 -translate-y-1/2 md:block">
-          <div className="glass flex items-center gap-3 rounded-panel px-4 py-3">
-            <Compass className="h-4 w-4 text-accent" />
-            <p className="text-[12.5px] text-muted">
-              Pick a country to hear its weekly Top 10
-            </p>
-          </div>
+        <div className="pointer-events-none absolute inset-x-0 top-1/2 z-20 -translate-y-1/2 px-6 text-center">
+          <p className="eyebrow chrome-text text-ink/75">Nothing selected</p>
+          <p className="display chrome-text mt-1.5 text-title text-ink">
+            Choose a country to see its chart
+          </p>
+          <p className="chrome-text mt-1 text-small text-ink/85">
+            Click the globe, or press ⌘K to search.
+          </p>
         </div>
       ) : null}
     </main>

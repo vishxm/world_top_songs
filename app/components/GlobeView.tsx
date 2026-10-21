@@ -10,7 +10,7 @@ import {
 } from "three";
 import { firstUnoccluded, GLOBE_RADIUS, surfaceDistance } from "~/lib/pick";
 import type { Region } from "~/lib/countryMeta";
-import type { ThemeTokens } from "~/hooks/useTheme";
+import type { GlobePalette } from "~/hooks/useGlobePalette";
 
 // react-globe.gl touches `window` at import time, so it must never load during
 // SSR: lazy() defers the import until the first client render and we only render
@@ -171,11 +171,11 @@ interface Props {
   /** When set, caps outside this region fade right down. */
   regionFilter: Region | null;
   /**
-   * Resolved canvas palette from the active theme. Passed in rather than read
-   * from CSS here: these callbacks run inside three-globe's digest, and a
-   * getComputedStyle() per polygon would force a style recalc mid-hover.
+   * Resolved canvas palette. Passed in rather than read from CSS here: these
+   * callbacks run inside three-globe's digest, and a getComputedStyle() per
+   * polygon would force a style recalc mid-hover.
    */
-  palette: ThemeTokens["globe"];
+  palette: GlobePalette;
   onHover: (c: StageCountry | null) => void;
   onSelect: (c: StageCountry) => void;
   /**
@@ -870,9 +870,5 @@ export default function GlobeView({
 
 /** Pre-hydration / pre-import placeholder that still reads as the stage. */
 function Stage() {
-  return (
-    <div className="absolute inset-0 bg-[var(--color-void)]">
-      <div className="absolute inset-0 opacity-70 [background:radial-gradient(60%_50%_at_50%_45%,color-mix(in_oklab,var(--color-accent)_7%,transparent),transparent_70%)]" />
-    </div>
-  );
+  return <div className="absolute inset-0 bg-void" />;
 }

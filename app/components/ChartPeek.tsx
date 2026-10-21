@@ -41,18 +41,18 @@ export default function ChartPeek({ iso, name, region, data, loading, onExpand }
         : "";
 
   return (
-    <section aria-label={`${name} chart`} className="lit glass overflow-hidden rounded-panel">
+    <section aria-label={`${name} chart`} className="surface overflow-hidden">
       <button
         type="button"
         onClick={onExpand}
         aria-label={`Show the ${name} chart`}
         aria-expanded="false"
-        className="group flex w-full items-center gap-3 px-3 py-2.5 text-left transition hover:bg-raised/50"
+        className="group flex w-full items-center gap-3 px-3 py-2.5 text-left transition hover:bg-raised/60"
       >
         <CountryMark iso={iso} region={region} size="sm" />
         <span className="min-w-0 flex-1">
-          <span className="block truncate text-[13px] leading-tight font-medium text-ink">{name}</span>
-          <span className="tnum mt-0.5 flex items-center gap-1 truncate text-[11px] leading-tight text-muted">
+          <span className="block truncate text-body font-medium text-ink">{name}</span>
+          <span className="tnum mt-0.5 flex items-center gap-1 truncate text-micro text-muted">
             {data && data.tracks.length === 0 ? (
               <Music className="h-3 w-3 shrink-0" aria-hidden />
             ) : null}
@@ -61,7 +61,7 @@ export default function ChartPeek({ iso, name, region, data, loading, onExpand }
         </span>
         <span
           aria-hidden
-          className="grid h-7 w-7 shrink-0 place-items-center rounded-lg text-faint transition group-hover:bg-raised group-hover:text-ink"
+          className="grid h-7 w-7 shrink-0 place-items-center rounded-control text-faint transition group-hover:bg-raised group-hover:text-ink"
         >
           <ChevronUp className="h-4 w-4" />
         </span>

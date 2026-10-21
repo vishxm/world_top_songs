@@ -41,7 +41,7 @@ function Movement({ track }: { track: ChartTrack }) {
   );
 }
 
-const MEDAL = ["text-[#f0c674]", "text-[#c9d1d9]", "text-[#d08c60]"];
+const MEDAL = ["text-ink", "text-ink", "text-ink"];
 
 interface Props {
   track: ChartTrack;
@@ -60,8 +60,8 @@ export default memo(function ChartRow({ track, index, isActive, isPlaying, isPau
         type="button"
         onClick={() => onPlay(index)}
         aria-current={isActive ? "true" : undefined}
-        className={`group relative flex w-full items-center gap-3 rounded-xl py-2 pr-2.5 pl-3 text-left transition-colors ${
-          isActive ? "bg-accent/10" : "hover:bg-raised"
+        className={`group relative flex w-full items-center gap-3 rounded-control py-2 pr-2.5 pl-3 text-left transition-colors ${
+          isActive ? "bg-raised" : "hover:bg-raised/70"
         }`}
       >
         {/* Active marker: a lit rail rather than a full-width wash. */}
@@ -73,31 +73,31 @@ export default memo(function ChartRow({ track, index, isActive, isPlaying, isPau
         />
 
         <span
-          className={`tnum w-5 shrink-0 text-center text-[13px] font-semibold tabular-nums ${
+          className={`tnum w-5 shrink-0 text-center text-body font-semibold tabular-nums ${
             index < 3 ? MEDAL[index] : "text-faint"
           }`}
         >
           {track.rank}
         </span>
 
-        <span className="relative aspect-video w-[52px] shrink-0 overflow-hidden rounded-md bg-raised ring-1 ring-line ring-inset">
+        <span className="relative aspect-video w-[52px] shrink-0 overflow-hidden rounded-control bg-raised ring-1 ring-line ring-inset">
           <img
             src={track.thumbnail}
             alt=""
             loading="lazy"
             decoding="async"
-            className="h-full w-full object-cover transition duration-500 group-hover:scale-[1.06]"
+            className="h-full w-full object-cover"
           />
           {isActive ? (
-            <span className="absolute inset-0 grid place-items-center bg-void/55 backdrop-blur-[1px]">
+            <span className="absolute inset-0 grid place-items-center bg-void/55">
               {live ? <Equalizer /> : <PlayGlyph />}
             </span>
           ) : null}
         </span>
 
         <span className="min-w-0 flex-1">
-          <span className="block truncate text-[13px] leading-tight font-medium text-ink">{track.title}</span>
-          <span className="mt-0.5 flex items-baseline gap-1.5 text-[11.5px] leading-tight text-muted">
+          <span className="block truncate text-body leading-tight font-medium text-ink">{track.title}</span>
+          <span className="mt-0.5 flex items-baseline gap-1.5 text-micro leading-tight text-muted">
             <span className="truncate">{track.artists}</span>
             {track.weeklyViews > 0 ? (
               <>

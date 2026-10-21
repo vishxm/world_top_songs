@@ -5,7 +5,7 @@ import type { Region } from "~/lib/countryMeta";
 import { isChartCountry } from "~/lib/countries";
 import { fmtWeek, plural } from "~/lib/format";
 import ChartRow from "./ChartRow";
-import { CountryMark, EmptyState, Pill, ChartRowSkeleton } from "./ui";
+import { CountryMark, EmptyState, ChartRowSkeleton } from "./ui";
 
 export type ChartKind = "songs" | "videos";
 
@@ -82,36 +82,24 @@ export default memo(function ChartPanel({
   return (
     <section
       aria-label={`${name} chart`}
-      className="lit glass flex h-full min-h-0 flex-col overflow-hidden rounded-panel"
+      className="surface flex h-full min-h-0 flex-col overflow-hidden"
     >
       {/* ---------------------------------------------------------- header */}
       <header className="shrink-0 px-4 pt-4 pb-3">
         <div className="flex items-start gap-3">
           <CountryMark iso={iso} region={region} size="lg" />
           <div className="min-w-0 flex-1">
-            <h2 className="display truncate text-[22px] leading-tight text-ink">{name}</h2>
-            <p className="mt-0.5 truncate text-[12px] text-muted">{provenance(data)}</p>
+            <h2 className="display truncate text-display text-ink">{name}</h2>
+            <p className="mt-0.5 truncate text-small text-muted">{provenance(data)}</p>
           </div>
-          <div className="flex shrink-0 items-center gap-1.5">
-            {data && data.source !== "live" ? (
-              <Pill
-                tone="accent"
-                title={
-                  data.source === "stale"
-                    ? "Live charts are unreachable — showing the last successful response"
-                    : "Live charts are unreachable — showing the built-in backup list"
-                }
-              >
-                {data.source === "stale" ? "cached" : "offline"}
-              </Pill>
-            ) : null}
+          <div className="flex shrink-0 items-center gap-1">
             {onFold ? (
               <button
                 type="button"
                 onClick={onFold}
                 aria-label="Collapse chart"
                 title="Collapse the chart and see the globe"
-                className="grid h-7 w-7 place-items-center rounded-lg text-faint transition hover:bg-raised hover:text-ink"
+                className="grid h-7 w-7 place-items-center rounded-control text-faint transition hover:bg-raised hover:text-ink"
               >
                 <ChevronDown className="h-4 w-4" />
               </button>
@@ -120,7 +108,7 @@ export default memo(function ChartPanel({
               type="button"
               onClick={onClose}
               aria-label="Close chart"
-              className="grid h-7 w-7 place-items-center rounded-lg text-faint transition hover:bg-raised hover:text-ink"
+              className="grid h-7 w-7 place-items-center rounded-control text-faint transition hover:bg-raised hover:text-ink"
             >
               <X className="h-4 w-4" />
             </button>
@@ -128,16 +116,12 @@ export default memo(function ChartPanel({
         </div>
 
         {!chartCountry ? (
-          <p className="mt-3 rounded-lg border border-line bg-raised/60 px-2.5 py-1.5 text-[11px] leading-snug text-muted">
+          <p className="mt-3 rounded-control border border-line bg-raised/60 px-2.5 py-1.5 text-micro leading-snug text-muted">
             No dedicated chart here — showing Spotify&apos;s weekly list, resolved to playable videos.
           </p>
         ) : null}
 
-        <div
-          role="tablist"
-          aria-label="Chart type"
-          className="mt-3 grid grid-cols-2 gap-1 rounded-xl border border-line bg-void/50 p-1"
-        >
+        <div role="tablist" aria-label="Chart type" className="mt-3 flex gap-1 border-b border-line">
           {KINDS.map((k) => (
             <button
               key={k.id}
@@ -145,8 +129,10 @@ export default memo(function ChartPanel({
               type="button"
               aria-selected={kind === k.id}
               onClick={() => onTab(k.id)}
-              className={`rounded-lg py-1.5 text-[12px] font-semibold transition ${
-                kind === k.id ? "bg-accent text-accent-ink" : "text-muted hover:text-ink"
+              className={`-mb-px flex-1 border-b-2 py-2 text-small font-medium transition ${
+                kind === k.id
+                  ? "border-accent text-ink"
+                  : "border-transparent text-muted hover:text-ink"
               }`}
             >
               {k.label}
@@ -171,11 +157,7 @@ export default memo(function ChartPanel({
             title="Couldn't load this chart"
             body={error}
             action={
-              <button
-                type="button"
-                onClick={onRetry}
-                className="rounded-full bg-accent px-4 py-1.5 text-[12px] font-semibold text-accent-ink transition hover:brightness-110"
-              >
+              <button type="button" onClick={onRetry} className="btn btn-primary">
                 Try again
               </button>
             }
@@ -210,7 +192,7 @@ export default memo(function ChartPanel({
       {/* ---------------------------------------------------------- footer */}
       {data && !loading && !error ? (
         <footer className="shrink-0 border-t border-line px-4 py-2.5">
-          <p className="tnum text-[11px] text-faint">
+          <p className="tnum text-micro text-faint">
             {plural(data.tracks.length, "track")}
             {data.week?.start ? ` · chart week ${fmtWeek(data.week)}` : ""}
           </p>

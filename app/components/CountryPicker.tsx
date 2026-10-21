@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { Check, Globe2, Search, Sparkles, X } from "lucide-react";
 import type { Region } from "~/lib/countryMeta";
 import { REGIONS } from "~/lib/countryMeta";
@@ -143,7 +144,7 @@ export default function CountryPicker({ countries, selectedIso, onPick }: Props)
         onClick={() => setOpen(true)}
         aria-haspopup="dialog"
         aria-expanded={open}
-        className="glass group flex h-9 items-center gap-2 rounded-xl pr-2.5 pl-2.5 text-[12.5px] transition hover:border-line-bright"
+        className="btn btn-quiet h-9 gap-2 px-2.5 text-small"
       >
         {selected ? (
           <>
@@ -156,118 +157,120 @@ export default function CountryPicker({ countries, selectedIso, onPick }: Props)
             <span className="text-muted">Pick a country</span>
           </>
         )}
-        <kbd className="ml-1 hidden rounded border border-line px-1.5 py-0.5 text-[10px] text-faint sm:inline">
-          ⌘K
-        </kbd>
+        <kbd className="kbd ml-1 hidden sm:inline-flex">⌘K</kbd>
       </button>
 
-      {open ? (
-        <div className="fixed inset-0 z-50 flex items-start justify-center px-4 pt-[12vh] sm:pt-[16vh]">
-          <button
-            type="button"
-            aria-label="Close country picker"
-            onClick={close}
-            className="absolute inset-0 bg-void/80 backdrop-blur-sm motion-safe:animate-fade"
-          />
-          <div
-            role="dialog"
-            aria-modal="true"
-            aria-label="Pick a country"
-            className="lit glass relative w-full max-w-lg overflow-hidden rounded-panel shadow-lift motion-safe:animate-rise"
-          >
-            <div className="flex items-center gap-2.5 border-b border-line px-4 py-3">
-              <Search className="h-4 w-4 shrink-0 text-faint" />
-              <input
-                ref={inputRef}
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                onKeyDown={onListKeyDown}
-                role="combobox"
-                aria-expanded="true"
-                aria-controls={listId}
-                aria-activedescendant={results[cursor] ? `${listId}-opt` : undefined}
-                aria-autocomplete="list"
-                placeholder="Search 236 countries…"
-                className="min-w-0 flex-1 bg-transparent text-[14px] text-ink outline-none placeholder:text-faint"
-              />
+      {open
+        ? createPortal(
+            <div className="fixed inset-0 z-50 flex items-start justify-center px-4 pt-[12vh] sm:pt-[16vh]">
               <button
                 type="button"
+                aria-label="Close country picker"
                 onClick={close}
-                aria-label="Close"
-                className="grid h-6 w-6 shrink-0 place-items-center rounded-md text-faint transition hover:bg-raised hover:text-ink"
+                className="absolute inset-0 bg-void/78 motion-safe:animate-fade"
+              />
+              <div
+                role="dialog"
+                aria-modal="true"
+                aria-label="Pick a country"
+                className="surface-pop relative w-full max-w-lg overflow-hidden motion-safe:animate-rise"
               >
-                <X className="h-3.5 w-3.5" />
-              </button>
-            </div>
+                <div className="flex items-center gap-2.5 border-b border-line px-4 py-3 ring-inset transition-colors focus-within:bg-raised/30 focus-within:ring-1 focus-within:ring-accent/35">
+                  <Search className="h-4 w-4 shrink-0 text-faint" />
+                  <input
+                    ref={inputRef}
+                    value={query}
+                    onChange={(e) => setQuery(e.target.value)}
+                    onKeyDown={onListKeyDown}
+                    role="combobox"
+                    aria-expanded="true"
+                    aria-controls={listId}
+                    aria-activedescendant={results[cursor] ? `${listId}-opt-${cursor}` : undefined}
+                    aria-autocomplete="list"
+                    aria-label="Search countries"
+                    placeholder="Search 236 countries…"
+                    className="min-w-0 flex-1 bg-transparent text-body text-ink outline-none placeholder:text-faint"
+                  />
+                  <button
+                    type="button"
+                    onClick={close}
+                    aria-label="Close"
+                    className="grid h-6 w-6 shrink-0 place-items-center rounded-[0.3125rem] text-faint transition hover:bg-raised hover:text-ink"
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </button>
+                </div>
 
-            <ul
-              ref={listRef}
-              id={listId}
-              role="listbox"
-              aria-label="Countries"
-              className="max-h-[52vh] overflow-y-auto overscroll-contain p-1.5"
-            >
-              {results.length === 0 ? (
-                <li className="px-3 py-8 text-center text-[13px] text-muted">
-                  No country matches “{query}”.
-                </li>
-              ) : null}
+                <ul
+                  ref={listRef}
+                  id={listId}
+                  role="listbox"
+                  aria-label="Countries"
+                  className="max-h-[52vh] overflow-y-auto overscroll-contain p-1.5"
+                >
+                  {results.length === 0 ? (
+                    <li className="px-3 py-8 text-center text-small text-muted">
+                      No country matches “{query}”.
+                    </li>
+                  ) : null}
 
-              {grouped
-                ? (() => {
-                    let idx = 0;
-                    return grouped.map(({ region, items }) => {
-                      const start = idx;
-                      idx += items.length;
-                      return (
-                        <li key={region}>
-                          <p className="px-2.5 pt-2.5 pb-1 text-[10px] font-semibold tracking-[0.12em] text-faint uppercase">
-                            {region}
-                            <span className="tnum ml-1.5 text-faint/60">{items.length}</span>
-                          </p>
-                          <ul role="group" aria-label={region}>
-                            {items.map((c, i) => (
-                              <Option
-                                key={c.iso}
-                                listId={listId}
-                                country={c}
-                                idx={start + i}
-                                active={start + i === cursor}
-                                selected={c.iso === selectedIso}
-                                onHover={setCursor}
-                                onChoose={choose}
-                              />
-                            ))}
-                          </ul>
-                        </li>
-                      );
-                    });
-                  })()
-                : results.map((c, i) => (
-                    <Option
-                      key={c.iso}
-                      listId={listId}
-                      country={c}
-                      idx={i}
-                      active={i === cursor}
-                      selected={c.iso === selectedIso}
-                      onHover={setCursor}
-                      onChoose={choose}
-                    />
-                  ))}
-            </ul>
+                  {grouped
+                    ? (() => {
+                        let idx = 0;
+                        return grouped.map(({ region, items }) => {
+                          const start = idx;
+                          idx += items.length;
+                          return (
+                            <li key={region}>
+                              <p className="eyebrow px-2.5 pt-2.5 pb-1">
+                                {region}
+                                <span className="tnum ml-1.5 text-faint/60">{items.length}</span>
+                              </p>
+                              <ul role="group" aria-label={region}>
+                                {items.map((c, i) => (
+                                  <Option
+                                    key={c.iso}
+                                    listId={listId}
+                                    country={c}
+                                    idx={start + i}
+                                    active={start + i === cursor}
+                                    selected={c.iso === selectedIso}
+                                    onHover={setCursor}
+                                    onChoose={choose}
+                                  />
+                                ))}
+                              </ul>
+                            </li>
+                          );
+                        });
+                      })()
+                    : results.map((c, i) => (
+                        <Option
+                          key={c.iso}
+                          listId={listId}
+                          country={c}
+                          idx={i}
+                          active={i === cursor}
+                          selected={c.iso === selectedIso}
+                          onHover={setCursor}
+                          onChoose={choose}
+                        />
+                      ))}
+                </ul>
 
-            <div className="flex items-center justify-between border-t border-line px-4 py-2 text-[10.5px] text-faint">
-              <span className="flex items-center gap-1.5">
-                <kbd className="rounded border border-line px-1">↑↓</kbd> move
-                <kbd className="rounded border border-line px-1">↵</kbd> select
-                <kbd className="rounded border border-line px-1">esc</kbd> close
-              </span>
-              <span className="tnum">{results.length} countries</span>
-            </div>
-          </div>
-        </div>
-      ) : null}
+                <div className="flex items-center justify-between border-t border-line px-4 py-2 text-micro text-faint">
+                  <span className="flex items-center gap-1.5">
+                    <kbd className="kbd">↑↓</kbd> move
+                    <kbd className="kbd">↵</kbd> select
+                    <kbd className="kbd">esc</kbd> close
+                  </span>
+                  <span className="tnum">{results.length} countries</span>
+                </div>
+              </div>
+            </div>,
+            document.body
+          )
+        : null}
     </>
   );
 }
@@ -290,17 +293,17 @@ function Option({
   onChoose: (c: StageCountry) => void;
 }) {
   return (
-    <li role="option" aria-selected={active} id={`${listId}-opt`} data-idx={idx}>
+    <li role="option" aria-selected={active} id={`${listId}-opt-${idx}`} data-idx={idx}>
       <button
         type="button"
         onClick={() => onChoose(country)}
         onMouseMove={() => onHover(idx)}
-        className={`flex w-full items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-left transition ${
-          active ? "bg-accent/12 text-ink" : "text-muted hover:bg-raised"
+        className={`flex w-full items-center gap-2.5 rounded-control px-2.5 py-1.5 text-left transition ${
+          active ? "bg-raised text-ink" : "text-muted hover:bg-raised/60"
         }`}
       >
         <CountryMark iso={country.iso} region={country.region} size="sm" />
-        <span className="min-w-0 flex-1 truncate text-[13px]">{country.name}</span>
+        <span className="min-w-0 flex-1 truncate text-small">{country.name}</span>
         {isChartCountry(country.iso) ? (
           <span
             title="Has its own weekly chart"

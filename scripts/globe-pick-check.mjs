@@ -461,69 +461,51 @@ check(
 );
 
 // ---------------------------------------------------------------------------
-// 8. The palette switcher. All four must stay reachable and each must actually
-//    repaint the globe — a swatch that renders but silently does nothing is the
-//    same class of dead control as the rail chips were.
+// 8. One theme. The four-palette switcher is gone, and the shell must boot
+//    straight into the single calm token set — no `data-theme` handoff, no
+//    swatches, no theme control hiding in the header.
 // ---------------------------------------------------------------------------
-stage("checking palette switcher");
-const palette = await page.evaluate(async () => {
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-  const datumOf = (o) => {
-    while (o) {
-      const d = o.__data && o.__data.data;
-      if (d && d.iso) return d;
-      o = o.parent;
-    }
-    return null;
-  };
-  // Read the SELECTED country's cap, resolved from the URL rather than hardcoded:
-  // earlier checks move the selection around, so a fixed ISO would quietly end up
-  // reporting base cap colours and the check would pass while proving less.
-  const selectedIso = new URLSearchParams(location.search).get("c");
-  const selHex = () => {
-    let out = null;
-    window.__globe.scene().traverse((o) => {
-      if (out || o.__globeObjType !== "polygon") return;
-      if (datumOf(o)?.iso !== selectedIso) return;
-      const m = Array.isArray(o.children[0].material) ? o.children[0].material[1] : null;
-      if (m) out = m.color.getHexString();
-    });
-    return out;
-  };
-  const radios = Array.from(document.querySelectorAll('[role="radio"]'));
-  const results = [];
-  for (const r of radios) {
-    const id = r.dataset.swatch;
-    r.click();
-    await sleep(900);
-    results.push({
-      id,
-      theme: document.documentElement.dataset.theme,
-      checked: r.getAttribute("aria-checked"),
-      label: r.getAttribute("aria-label"),
-      globeHex: selHex(),
-    });
-  }
+stage("checking the single theme");
+const themeState = await page.evaluate(() => {
+  const root = document.documentElement;
+  const css = getComputedStyle(root);
+  const body = getComputedStyle(document.body);
+  // Resolve the expected stage colour from the same token the shell uses, so
+  // this does not hardcode a hex that a future palette tweak would break.
+  const probe = document.createElement("span");
+  probe.style.background = "var(--color-void)";
+  document.body.appendChild(probe);
+  const expectedBg = getComputedStyle(probe).backgroundColor;
+  probe.remove();
   return {
-    results,
-    count: radios.length,
-    group: !!document.querySelector('[role="radiogroup"][aria-label]'),
-    // A radiogroup is one tab stop: only the checked radio may be tabbable.
-    tabbable: radios.filter((r) => r.tabIndex === 0).length,
-    checkedCount: radios.filter((r) => r.getAttribute("aria-checked") === "true").length,
+    dataTheme: root.getAttribute("data-theme"),
+    swatches: document.querySelectorAll("[data-swatch]").length,
+    paletteGroups: document.querySelectorAll(
+      '[role="radiogroup"][aria-label*="palette" i], [role="radiogroup"][aria-label*="colour" i]'
+    ).length,
+    themeControls: Array.from(document.querySelectorAll("header button")).filter((b) =>
+      /theme|palette|colour/i.test(b.getAttribute("aria-label") ?? "")
+    ).length,
+    bodyBg: body.backgroundColor,
+    expectedBg,
+    ink: css.getPropertyValue("--color-ink").trim(),
+    accent: css.getPropertyValue("--color-accent").trim(),
+    colorScheme: css.colorScheme,
   };
 });
-const distinct = new Set(palette.results.map((r) => r.globeHex));
 check(
-  "all four palettes are offered and each repaints the globe",
-  palette.count === 4 &&
-    palette.group &&
-    palette.tabbable === 1 &&
-    palette.checkedCount === 1 &&
-    distinct.size === 4 &&
-    palette.results.every((r) => r.checked === "true"),
-  `${palette.count} swatches, ${distinct.size} distinct globe fills, ${palette.tabbable} tab stop, ${palette.checkedCount} checked — ` +
-    palette.results.map((r) => `${r.id}:${r.globeHex}`).join(" ")
+  "one calm theme, with no theme switcher",
+  themeState.dataTheme === null &&
+    themeState.swatches === 0 &&
+    themeState.paletteGroups === 0 &&
+    themeState.themeControls === 0 &&
+    themeState.bodyBg === themeState.expectedBg &&
+    !!themeState.ink &&
+    !!themeState.accent &&
+    themeState.colorScheme === "dark",
+  `data-theme=${themeState.dataTheme ?? "none"}, ${themeState.swatches} swatches, ` +
+    `${themeState.paletteGroups} palette groups, ${themeState.themeControls} theme controls, ` +
+    `body ${themeState.bodyBg} (token ${themeState.expectedBg}), ink ${themeState.ink}, accent ${themeState.accent}`
 );
 
 check("no page errors", pageErrors.length === 0, pageErrors.slice(0, 3).join(" | "));

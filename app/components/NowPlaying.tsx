@@ -482,10 +482,10 @@ export default function NowPlaying({ tracks, activeIndex, onSelect, onEnded, onP
   if (!active) return null;
 
   return (
-    <section aria-label="Now playing" className="lit glass overflow-hidden rounded-panel">
+    <section aria-label="Now playing" className="surface overflow-hidden">
       {/* Video expands on demand instead of permanently occupying a 16:9 box. */}
       <div
-        className={`grid transition-[grid-template-rows,opacity] duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+        className={`grid transition-[grid-template-rows,opacity] duration-slow ease-[var(--ease-out)] ${
           videoOpen ? "grid-rows-[1fr] opacity-100" : "grid-rows-[0fr] opacity-0"
         }`}
       >
@@ -506,7 +506,7 @@ export default function NowPlaying({ tracks, activeIndex, onSelect, onEnded, onP
               type="button"
               onClick={() => setVideoOpen(false)}
               aria-label="Hide video"
-              className="absolute top-2 right-2 grid h-7 w-7 place-items-center rounded-lg bg-void/70 text-ink backdrop-blur transition hover:bg-void"
+              className="absolute top-2 right-2 grid h-7 w-7 place-items-center rounded-control bg-void/70 text-ink transition hover:bg-void"
             >
               <Icon d={PATHS.collapse} className="h-3.5 w-3.5" />
             </button>
@@ -518,7 +518,7 @@ export default function NowPlaying({ tracks, activeIndex, onSelect, onEnded, onP
         {/* Scrubber. The native range input is transparent and sits on top of the
             painted rail, so keyboard, drag and screen-reader semantics are free
             while the visuals stay driven by direct DOM writes. */}
-        <div className="relative -mx-1 h-4">
+        <div className="relative -mx-1 h-4 rounded-full focus-within:outline-2 focus-within:outline-accent/70 focus-within:outline-offset-2">
           <span className="pointer-events-none absolute inset-x-1 top-1/2 h-[3px] -translate-y-1/2 overflow-hidden rounded-full bg-raised">
             {/* The starting scale is set inline, NOT with `scale-x-0`. Tailwind v4
                 compiles `scale-x-0` to the standalone `scale: 0 1` property, and a
@@ -552,7 +552,7 @@ export default function NowPlaying({ tracks, activeIndex, onSelect, onEnded, onP
         </div>
 
         <div className="mt-2 flex items-center gap-2.5">
-          <span ref={timeRef} className="tnum w-[76px] shrink-0 text-[10.5px] text-faint">
+          <span ref={timeRef} className="tnum w-[76px] shrink-0 text-micro text-faint">
             0:00
           </span>
 
@@ -561,7 +561,7 @@ export default function NowPlaying({ tracks, activeIndex, onSelect, onEnded, onP
               type="button"
               onClick={() => step(-1)}
               aria-label="Previous track"
-              className="grid h-8 w-8 place-items-center rounded-lg text-muted transition hover:bg-raised hover:text-ink"
+              className="grid h-8 w-8 place-items-center rounded-control text-muted transition hover:bg-raised hover:text-ink"
             >
               <Icon d={PATHS.prev} />
             </button>
@@ -569,7 +569,7 @@ export default function NowPlaying({ tracks, activeIndex, onSelect, onEnded, onP
               type="button"
               onClick={toggle}
               aria-label={needsGesture ? "Start playback" : playing ? "Pause" : "Play"}
-              className="grid h-9 w-9 place-items-center rounded-full bg-accent text-accent-ink transition hover:brightness-110 active:scale-95"
+              className="grid h-9 w-9 place-items-center rounded-pill bg-accent text-accent-ink transition hover:brightness-110 active:scale-95"
             >
               {buffering ? (
                 <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-current border-t-transparent" />
@@ -581,17 +581,17 @@ export default function NowPlaying({ tracks, activeIndex, onSelect, onEnded, onP
               type="button"
               onClick={() => step(1)}
               aria-label="Next track"
-              className="grid h-8 w-8 place-items-center rounded-lg text-muted transition hover:bg-raised hover:text-ink"
+              className="grid h-8 w-8 place-items-center rounded-control text-muted transition hover:bg-raised hover:text-ink"
             >
               <Icon d={PATHS.next} />
             </button>
           </div>
 
           <span className="min-w-0 flex-1">
-            <span className="block truncate text-[12.5px] leading-tight font-medium text-ink">
+            <span className="block truncate text-small leading-tight font-medium text-ink">
               {active.title}
             </span>
-            <span className="block truncate text-[11px] leading-tight text-muted">{active.artists}</span>
+            <span className="block truncate text-micro leading-tight text-muted">{active.artists}</span>
           </span>
 
           <div className="group/vol flex shrink-0 items-center gap-1">
@@ -599,7 +599,7 @@ export default function NowPlaying({ tracks, activeIndex, onSelect, onEnded, onP
               type="button"
               onClick={toggleMute}
               aria-label={muted ? "Unmute" : "Mute"}
-              className="grid h-8 w-8 place-items-center rounded-lg text-muted transition hover:bg-raised hover:text-ink"
+              className="grid h-8 w-8 place-items-center rounded-control text-muted transition hover:bg-raised hover:text-ink"
             >
               <Icon d={muted ? PATHS.muted : PATHS.volume} className="h-3.5 w-3.5" />
             </button>
@@ -619,7 +619,7 @@ export default function NowPlaying({ tracks, activeIndex, onSelect, onEnded, onP
             onClick={() => setVideoOpen((v) => !v)}
             aria-label={videoOpen ? "Hide video" : "Show video"}
             aria-pressed={videoOpen}
-            className="grid h-8 w-8 shrink-0 place-items-center rounded-lg text-muted transition hover:bg-raised hover:text-ink"
+            className="grid h-8 w-8 shrink-0 place-items-center rounded-control text-muted transition hover:bg-raised hover:text-ink"
           >
             <Icon d={videoOpen ? PATHS.collapse : PATHS.video} className="h-4 w-4" />
           </button>
@@ -629,7 +629,7 @@ export default function NowPlaying({ tracks, activeIndex, onSelect, onEnded, onP
           <button
             type="button"
             onClick={toggle}
-            className="mt-2 w-full rounded-lg bg-accent/12 py-1.5 text-[11.5px] font-semibold text-accent transition hover:bg-accent/20"
+            className="mt-2 w-full rounded-control border border-accent/30 bg-accent/10 py-1.5 text-micro font-semibold text-accent transition hover:bg-accent/15"
           >
             Browser blocked autoplay — tap to start
           </button>

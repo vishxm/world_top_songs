@@ -62,7 +62,7 @@ itself, and `globe-pick-check.mjs` for the wiring that only exists at runtime.
    styling funnels through `applyHoverVisuals()`, and the effect that calls it
    lists `selectedIso` explicitly. It used to list only its own callback, so the
    repaint fired when the *hover* changed and at no other time. Selecting from the
-   ⌘K palette, the region rail, Surprise me or the back button left the previous
+   ⌘K picker, the region rail, Surprise me or the back button left the previous
    country lit and the new one unlit until the pointer next moved — the pointer
    being off the canvas is precisely the case that had no repaint. `hoverIso` is
    deliberately *not* a dependency: hover is applied synchronously inside the
@@ -163,15 +163,15 @@ and the audio keeps playing. Wide layouts have a rail rather than a sheet, so
 
 `sheetReserve` in `_index.tsx` is the sheet's height in px, and it is the *only*
 number the globe offset, the camera altitude and the chrome offsets are derived
-from — the rail and the hint read it back out of a `--sheet-h` custom property on
-`<main>`, because `bottom-[calc(48vh+1.25rem)]` is simply the wrong number once the
-sheet can be 56px tall, and Tailwind cannot compute one class from another. Two
+from — the rail reads it back out of a `--sheet-h` custom property on `<main>`,
+because `bottom-[calc(48vh+1.25rem)]` is simply the wrong number once the sheet
+can be 56px tall, and Tailwind cannot compute one class from another. Two
 consequences worth keeping:
 
 - **With nothing selected it still reserves the full `48vh`.** No sheet is on
-  screen, but the globe and the hint are framed against that reservation, so
-  collapsing it to the peek bar silently moved both on a first visit before the
-  bootstrap had picked a country.
+  screen, but the globe is framed against that reservation, so collapsing it to
+  the peek bar silently moved it on a first visit before the bootstrap had picked
+  a country.
 - **`globeOffset` is gone, replaced by an imperative tween.** As a prop,
   three-globe applies it on the frame it changes, which turned a fold into a ~200px
   jump; and because the route re-renders on every globe hover, a fresh array each
@@ -181,7 +181,7 @@ consequences worth keeping:
   never been offset, so tweening out of that start slides the globe across the
   screen on every load, and skipping the write leaves it centred under the panel.
 
-A tap that hits a country always unfolds, on every path — globe, palette and Surprise
+A tap that hits a country always unfolds, on every path — globe, picker and Surprise
 me all go through `select`. Left folded, that tap lights the country up and appears
 to do nothing, because the list it asked for is hidden.
 
@@ -198,17 +198,24 @@ Regenerate with `npm run map:layers` (after changing `world-50m-simple.geojson`)
 Gate with `npm run check:map`. `app/lib/countryMeta.ts` is also generated — edit
 the override tables in `scripts/build-country-meta.mjs` and re-run.
 
-## Visual themes
+## Design system
 
-`app/app.css` holds the token set. The header's theme button cycles
-`<html data-theme>` across four directions; each only overrides CSS variables,
-including a separate `--globe-*` set for canvas colours (three-globe needs
-concrete colour strings, not `color-mix`). Add a direction there, not in JS.
+`app/app.css` holds the whole token set: one theme, warm charcoal and bone with a
+single brass accent, Fraunces for names, Inter for controls and numbers, a small
+fixed type scale, three radii, two shadows and motion tokens. There is no theme
+switcher and no `<html data-theme>` handoff; the shell boots straight into these
+values, so there is no theme flash.
 
-All four directions use the same night texture, which constrains the globe tokens
-in every theme: `--globe-border` must be *light* or it disappears into the dark
-limb, and `--globe-cap-hover` must differ in hue from `--globe-cap-selected`
-because hover no longer lifts the cap.
+Canvas colours are the one exception. three-globe needs concrete colour strings,
+not `color-mix`, so `--globe-*` lives in the same file and
+`app/hooks/useGlobePalette.ts` reads it once. Keep `--globe-border` *light* so it
+reads against the sphere, and keep `--globe-cap-hover` a different hue from
+`--globe-cap-selected` because hover does not lift the cap.
+
+Colour and motion carry state only — hover, selection, playback, movement. The
+equaliser is the only looping animation left. Surfaces are solid, never frosted;
+a new component should use `.surface`, `.btn`, `.chip`, `.kbd` and `.eyebrow`
+rather than composing its own radius, shadow or type size.
 
 ## Agent skills
 
