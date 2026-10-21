@@ -21,9 +21,13 @@
 //   9. back and forward restore the URL-selected country
 //  10. bad country codes recover with an explanation, and unknown routes land on
 //      the branded recovery screen
+//  11. the country picker opens from every shortcut, matches names and ISO codes,
+//      marks charted countries, and updates the URL
+//  12. Surprise me only ever lands on a charted country
 //
 // Run it against a dev server. Usage: node scripts/globe-pick-check.mjs [url]
 import { chromium } from "playwright";
+import { CHART_ISOS } from "../app/lib/countries.ts";
 
 const URL_ = process.argv[2] ?? "http://localhost:5173/?c=US";
 const BASE = new URL(URL_).origin;
@@ -270,10 +274,10 @@ const capState = (iso) =>
 await page.mouse.move(1400, 450);
 const startIso = await page.evaluate(() => new URLSearchParams(location.search).get("c"));
 await page.evaluate(() => document.querySelector('header button[aria-haspopup="dialog"]').click());
-await page.waitForSelector('[role="listbox"][aria-label="Countries"] li[role="option"] button', {
+await page.waitForSelector('[role="listbox"][aria-label="Countries"] [role="option"]', {
   timeout: 10_000,
 });
-await page.evaluate(() => document.querySelector('[role="listbox"] li[role="option"] button').click());
+await page.evaluate(() => document.querySelector('[role="listbox"] [role="option"]').click());
 await page.waitForTimeout(1800);
 const selAfterPick = await page.evaluate(() => new URLSearchParams(location.search).get("c"));
 const newCap = await capState(selAfterPick);
@@ -546,6 +550,191 @@ check(
     forwardCap.opacity !== null &&
     forwardCap.opacity > 0.5,
   `${startIso} <- back ${backIso}@${backCap?.opacity}, forward ${forwardIso}@${forwardCap?.opacity}`
+);
+
+// ---------------------------------------------------------------------------
+// 11 + 12. The country picker and Surprise me.
+//
+// The picker is the keyboard path to every country, so these are interaction
+// assertions, not snapshot checks: the shortcuts must open it with the search
+// focused, Escape must hand focus back, a query must match an ISO code that
+// appears nowhere in the country's name, Enter must update the URL and close,
+// and the charted/uncharted distinction must survive into the accessibility tree.
+// ---------------------------------------------------------------------------
+stage("checking the country picker");
+const PICKER_TRIGGER = 'header button[aria-haspopup="dialog"]';
+const PICKER_DIALOG = '[role="dialog"][aria-label="Pick a country"]';
+const PICKER_INPUT = `${PICKER_DIALOG} input[role="combobox"]`;
+
+const readPicker = async () => {
+  await page.waitForTimeout(60);
+  return page.evaluate(() => {
+    const dialog = document.querySelector('[role="dialog"][aria-label="Pick a country"]');
+    if (!dialog) return null;
+    const input = dialog.querySelector('input[role="combobox"]');
+    const options = Array.from(dialog.querySelectorAll('[role="option"]'));
+    const activeId = input?.getAttribute("aria-activedescendant");
+    const active = options.find((o) => o.id === activeId) ?? null;
+    return {
+      focus: document.activeElement === input,
+      value: input?.value ?? null,
+      activeLabel: active?.getAttribute("aria-label") ?? null,
+      activeIso: active?.getAttribute("data-iso") ?? null,
+      groups: Array.from(dialog.querySelectorAll('[role="group"]')).map((g) =>
+        g.getAttribute("aria-label")
+      ),
+      labels: options.map((o) => o.getAttribute("aria-label")),
+      status: dialog.querySelector('[role="status"]')?.textContent?.trim() ?? null,
+      footer: dialog.lastElementChild?.textContent?.replace(/\s+/g, " ").trim() ?? "",
+      text: dialog.textContent ?? "",
+    };
+  });
+};
+
+const readTrigger = () =>
+  page.evaluate((sel) => {
+    const trigger = document.querySelector(sel);
+    return {
+      focused: document.activeElement === trigger,
+      expanded: trigger?.getAttribute("aria-expanded") ?? null,
+    };
+  }, PICKER_TRIGGER);
+
+const openFrom = async (key) => {
+  await page.keyboard.press(key);
+  await page.waitForSelector(PICKER_DIALOG, { timeout: 5_000 });
+  return readPicker();
+};
+
+// Focus the trigger explicitly: the gate has been clicking through native
+// history, which leaves focus on the document rather than on any control.
+await page.evaluate((sel) => document.querySelector(sel).focus(), PICKER_TRIGGER);
+
+const metaOpen = await openFrom("Meta+k");
+check(
+  "⌘K opens the picker with the search focused",
+  !!metaOpen?.focus && metaOpen.labels.length > 100,
+  metaOpen ? `${metaOpen.labels.length} options, search focused ${metaOpen.focus}` : "no dialog"
+);
+
+await page.keyboard.press("Escape");
+await page.waitForSelector(PICKER_DIALOG, { state: "detached", timeout: 5_000 });
+const escaped = await readTrigger();
+check(
+  "Escape closes the picker and returns focus to its trigger",
+  escaped.focused && escaped.expanded === "false",
+  `focus ${escaped.focused}, aria-expanded ${escaped.expanded}`
+);
+
+const ctrlOpen = await openFrom("Control+k");
+check("Ctrl-K opens the picker", !!ctrlOpen?.focus, ctrlOpen ? `search focused ${ctrlOpen.focus}` : "no dialog");
+
+// Empty query: region groups, and a quiet charted/uncharted marker.
+const usLabel = ctrlOpen?.labels.find((l) => l?.startsWith("United States,"));
+const andorraLabel = ctrlOpen?.labels.find((l) => l?.startsWith("Andorra,"));
+check(
+  "empty query groups countries by region",
+  (ctrlOpen?.groups.length ?? 0) >= 5 && !!ctrlOpen?.groups.includes("Africa"),
+  ctrlOpen?.groups.join(", ")
+);
+check(
+  "charted and uncharted countries are marked quietly",
+  !!usLabel?.includes("has an official chart") &&
+    !!andorraLabel?.includes("no official chart") &&
+    /Charted/.test(ctrlOpen?.footer ?? "") &&
+    /Uncharted/.test(ctrlOpen?.footer ?? "") &&
+    !/Spotify|fallback/i.test(ctrlOpen?.text ?? ""),
+  `${usLabel} / ${andorraLabel} / ${ctrlOpen?.footer}`
+);
+
+// ISO matching: "gb" is in neither "United Kingdom" nor its alias, so only the
+// code can put it first.
+await page.fill(PICKER_INPUT, "gb");
+const isoMatch = await readPicker();
+check(
+  "typing an ISO code finds that country",
+  !!isoMatch?.labels[0]?.startsWith("United Kingdom,"),
+  isoMatch?.labels.slice(0, 3).join(" | ")
+);
+
+await page.fill(PICKER_INPUT, "cote");
+const folded = await readPicker();
+check(
+  "typing without diacritics still finds the country",
+  !!folded?.labels.some((l) => l?.startsWith("Côte d'Ivoire,")),
+  folded?.labels.slice(0, 3).join(" | ")
+);
+
+await page.fill(PICKER_INPUT, "zzzzzz");
+const nothing = await readPicker();
+check(
+  "no matches shows an empty state",
+  nothing?.labels.length === 0 && /No country matches/.test(nothing.status ?? ""),
+  `${nothing?.labels.length} options, status ${nothing?.status}`
+);
+
+// Arrows move the active option; Enter selects whichever option is active and
+// the route writes it to the URL before the dialog closes.
+await page.fill(PICKER_INPUT, "united");
+const beforeArrow = await readPicker();
+await page.keyboard.press("ArrowDown");
+const afterArrow = await readPicker();
+check(
+  "arrow keys move the active option",
+  !!beforeArrow?.activeLabel &&
+    !!afterArrow?.activeLabel &&
+    beforeArrow.activeLabel !== afterArrow.activeLabel,
+  `${beforeArrow?.activeLabel} -> ${afterArrow?.activeLabel}`
+);
+
+await page.keyboard.press("Enter");
+await page.waitForSelector(PICKER_DIALOG, { state: "detached", timeout: 5_000 });
+await page.waitForTimeout(150);
+const enterPick = await page.evaluate(() => new URLSearchParams(location.search).get("c"));
+const enterTrigger = await readTrigger();
+check(
+  "Enter selects, closes the picker and updates the URL",
+  !!afterArrow?.activeIso && enterPick === afterArrow.activeIso && enterTrigger.focused,
+  `${afterArrow?.activeLabel} -> ?c=${enterPick}, focus ${enterTrigger.focused}`
+);
+
+const slashOpen = await openFrom("/");
+check("slash opens the picker", !!slashOpen?.focus, slashOpen ? `search focused ${slashOpen.focus}` : "no dialog");
+
+// The grouped (empty-query) order is region order, while the unfiltered result
+// list is global alphabetical order. Selection must read from the order that is
+// rendered, or Enter silently picks a country other than the highlighted one.
+await page.keyboard.press("ArrowDown");
+const groupedMoved = await readPicker();
+check(
+  "arrows move through the region-grouped order",
+  !!slashOpen?.activeIso &&
+    !!groupedMoved?.activeIso &&
+    slashOpen.activeIso !== groupedMoved.activeIso,
+  `${slashOpen?.activeLabel} -> ${groupedMoved?.activeLabel}`
+);
+await page.keyboard.press("Enter");
+await page.waitForSelector(PICKER_DIALOG, { state: "detached", timeout: 5_000 });
+await page.waitForTimeout(150);
+const groupedPick = await page.evaluate(() => new URLSearchParams(location.search).get("c"));
+check(
+  "Enter selects the highlighted grouped option",
+  !!groupedMoved?.activeIso && groupedPick === groupedMoved.activeIso,
+  `${groupedMoved?.activeLabel} -> ?c=${groupedPick}`
+);
+
+stage("checking Surprise me");
+const charted = new Set(CHART_ISOS);
+const surprises = [];
+for (let i = 0; i < 4; i++) {
+  await page.evaluate(() => document.querySelector('button[aria-label="Surprise me"]').click());
+  await page.waitForTimeout(120);
+  surprises.push(await page.evaluate(() => new URLSearchParams(location.search).get("c")));
+}
+check(
+  "Surprise me selects only charted countries",
+  surprises.every((iso) => !!iso && charted.has(iso)),
+  surprises.join(", ")
 );
 
 check("no page errors", pageErrors.length === 0, pageErrors.slice(0, 3).join(" | "));
