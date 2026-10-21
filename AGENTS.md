@@ -209,3 +209,17 @@ All four directions use the same night texture, which constrains the globe token
 in every theme: `--globe-border` must be *light* or it disappears into the dark
 limb, and `--globe-cap-hover` must differ in hue from `--globe-cap-selected`
 because hover no longer lifts the cap.
+
+## Agent skills
+
+### Issue tracker
+
+Issues and specs live as GitHub issues, managed with the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The five canonical triage roles map 1:1 to label strings. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: `CONTEXT.md` at the repo root, decisions under `docs/adr/`. See `docs/agents/domain.md`.
