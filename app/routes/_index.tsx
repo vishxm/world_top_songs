@@ -103,6 +103,10 @@ export default function Home() {
   const [borders, setBorders] = useState<[number, number][][]>([]);
   const [mapError, setMapError] = useState<string | null>(null);
   const [mapLoading, setMapLoading] = useState(true);
+  /** Set by GlobeView once the caps exist and picking is live. Until then the
+   *  stage shows its loading copy and the canvas ignores pointer input. */
+  const [globeReady, setGlobeReady] = useState(false);
+  const handleGlobeInteractive = useCallback(() => setGlobeReady(true), []);
 
   const [hovered, setHovered] = useState<StageCountry | null>(null);
   const [regionFilter, setRegionFilter] = useState<Region | null>(null);
@@ -441,6 +445,7 @@ export default function Home() {
           onHover={setHovered}
           onSelect={select}
           onEmptyTap={foldSheet}
+          onInteractive={handleGlobeInteractive}
         />
       </section>
 
@@ -562,21 +567,33 @@ export default function Home() {
           : ""}
       </p>
 
-      {/* The stage's own loading state. A static mark rather than a pulse: the
-          wait is short, and an animated ring competes with the globe it is
-          announcing. */}
-      {!selected && (mapLoading || countries.length === 0) ? (
-        <div className="pointer-events-none absolute inset-0 z-20 grid place-items-center">
-          <div className="flex flex-col items-center gap-3 text-center motion-safe:animate-fade">
-            <AtlasMark className="h-8 w-8 text-accent" />
-            <p className="eyebrow">Loading the atlas</p>
-          </div>
+      {/* The stage's own loading state, mounted from the first server render so
+          there is never a blank frame waiting for the canvas. It stays in place
+          (transparent and pointer-transparent) once the globe is interactive,
+          which gives the handover a crossfade instead of a pop. A static mark
+          rather than a pulse: the wait is short, and an animated ring competes
+          with the globe it is announcing. */}
+      <div
+        id="stage-loading"
+        role="status"
+        aria-live="polite"
+        aria-hidden={globeReady}
+        className={`pointer-events-none absolute inset-0 z-20 grid place-items-center transition-opacity duration-[var(--duration-slow)] ease-[var(--ease-out)] ${
+          globeReady ? "opacity-0" : "opacity-100"
+        }`}
+      >
+        <div className="flex flex-col items-center gap-3 text-center">
+          <AtlasMark className="h-8 w-8 text-accent" />
+          <p className="eyebrow">
+            {mapLoading || countries.length === 0 ? "Loading the atlas" : "Drawing the globe"}
+          </p>
         </div>
-      ) : null}
+      </div>
 
       {/* Empty stage: a sentence in the middle of the sphere, not a floating
-          card. The globe remains the thing to touch. */}
-      {!selected && countries.length > 0 && !mapLoading ? (
+          card. The globe remains the thing to touch — and only appears once it
+          is actually interactive, so it never collides with the loading copy. */}
+      {!selected && globeReady ? (
         <div className="pointer-events-none absolute inset-x-0 top-1/2 z-20 -translate-y-1/2 px-6 text-center">
           <p className="eyebrow chrome-text text-ink/75">Nothing selected</p>
           <p className="display chrome-text mt-1.5 text-title text-ink">

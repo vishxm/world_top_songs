@@ -37,15 +37,17 @@
 
   /* Canvas colours. three-globe needs concrete colour strings, so the globe
      palette is its own set. One theme now: the values are read once by
-     `useGlobePalette` and never re-skinned. Borders stay light so they read
-     against the sphere; hover and selection differ in hue, not only opacity. */
+     `useGlobePalette` and never re-skinned. The sphere is a flat matte tone —
+     no texture, no lights — that sits a step above the void; borders stay light
+     so they read against it, and hover and selection differ in hue, not only
+     opacity. */
+  --globe-sphere: #191d19;
   --globe-cap: rgba(190, 196, 178, 0.18);
   --globe-cap-dim: rgba(160, 166, 152, 0.075);
   --globe-cap-hover: rgba(236, 229, 208, 0.48);
   --globe-cap-selected: rgba(217, 166, 75, 0.93);
   --globe-cap-outline: #f1d29a;
   --globe-border: #b9c0ae;
-  --globe-atmosphere: #6f7468;
 
   /* Type ------------------------------------------------------------------ */
   --font-sans: "Inter Variable", ui-sans-serif, system-ui, -apple-system, sans-serif;

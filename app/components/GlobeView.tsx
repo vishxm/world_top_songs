@@ -4,6 +4,7 @@ import {
   Float32BufferAttribute,
   LineBasicMaterial,
   LineSegments,
+  MeshBasicMaterial,
   Object3D,
   Raycaster,
   Vector2,
@@ -71,6 +72,12 @@ const OUTLINE_ALTITUDE = CAP_SELECTED + 0.0015;
 // the farthest hit and can never steal a hover.
 const BORDER_ALTITUDE = 0.002;
 
+// The renderer is sized in device pixels, so the hairline borders stay crisp on
+// a retina display. Clamped because a 3x canvas triples the fill cost for no
+// visible gain, and three-render-objects makes the same clamp itself.
+const MAX_DPR = 2;
+
+/** How long the globe sits still before its idle rotation begins. */
 const IDLE_SPIN_DELAY_MS = 5200;
 const IDLE_SPIN_SPEED = 0.28;
 
@@ -179,6 +186,11 @@ interface Props {
   onHover: (c: StageCountry | null) => void;
   onSelect: (c: StageCountry) => void;
   /**
+   * The scene is rendered, the caps have been built and picking is live. The
+   * route uses this to hand its loading state over to the globe; it fires once.
+   */
+  onInteractive?: () => void;
+  /**
    * A tap that landed on the globe but hit no country — ocean, sky, or the space
    * around the planet. On narrow layouts the route uses this to fold the chart
    * sheet away, so the globe can be seen without deselecting the country.
@@ -202,16 +214,26 @@ export default function GlobeView({
   onHover,
   onSelect,
   onEmptyTap,
+  onInteractive,
 }: Props) {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const globeRef = useRef<any>(null);
-  const [dimensions, setDimensions] = useState({ w: 0, h: 0 });
+  /** The stage box itself, measured — never the window, so an inset stage or a
+   *  resize of the surrounding layout is reflected in the canvas. */
+  const stageRef = useRef<HTMLDivElement | null>(null);
+  const [dimensions, setDimensions] = useState({ w: 0, h: 0, dpr: 1 });
   const [mounted, setMounted] = useState(false);
   const [sceneReady, setSceneReady] = useState(false);
+  /** The scene exists *and* the country caps have been built, so a pick can
+   *  succeed. This is the point the loading state hands over. */
+  const [interactive, setInteractive] = useState(false);
 
   // Hover bookkeeping lives in refs so a pointer storm never re-renders the route.
   const lastHoverIso = useRef<string | null>(null);
   const idleTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  /** Set by the first real interaction. Idle rotation is a one-time invitation:
+   *  once the user has taken the globe, it never starts itself again. */
+  const interacted = useRef(false);
   /** Mirrors `selectedIso` so the idle timer can re-check it without being
    *  re-created (and re-armed) on every selection. */
   const selectedIsoRef = useRef<string | null>(selectedIso);
@@ -236,12 +258,34 @@ export default function GlobeView({
   const pointer = useRef<{ x: number; y: number } | null>(null);
   const pickRaf = useRef(0);
 
+  /**
+   * Measure the stage box and never the window.
+   *
+   * The stage is `inset-0` today, so the two agree — but the canvas must follow
+   * the box it actually occupies, or a future inset/rail/resize changes the
+   * layout while the renderer keeps its old size and the globe jumps. The
+   * ResizeObserver catches layout changes as well as viewport ones; the window
+   * `resize` listener is still needed because browser zoom changes
+   * `devicePixelRatio` without necessarily changing the CSS box, and a window
+   * moved between displays does the same.
+   */
   useEffect(() => {
     setMounted(true);
-    const update = () => setDimensions({ w: window.innerWidth, h: window.innerHeight });
+    const el = stageRef.current;
+    if (!el) return;
+    const update = () => {
+      const rect = el.getBoundingClientRect();
+      const w = Math.max(1, Math.round(rect.width));
+      const h = Math.max(1, Math.round(rect.height));
+      const dpr = Math.min(MAX_DPR, window.devicePixelRatio || 1);
+      setDimensions((d) => (d.w === w && d.h === h && d.dpr === dpr ? d : { w, h, dpr }));
+    };
     update();
+    const observer = new ResizeObserver(update);
+    observer.observe(el);
     window.addEventListener("resize", update);
     return () => {
+      observer.disconnect();
       window.removeEventListener("resize", update);
       if (idleTimer.current) clearTimeout(idleTimer.current);
     };
@@ -259,33 +303,62 @@ export default function GlobeView({
     }
   }, []);
 
+  const stopIdleSpin = useCallback(() => {
+    if (idleTimer.current) clearTimeout(idleTimer.current);
+    idleTimer.current = undefined;
+    setSpinning(false);
+  }, [setSpinning]);
+
+  /**
+   * The first real interaction hands the globe to the user. Idle rotation is an
+   * invitation, not a behaviour that resumes behind their back: once they have
+   * dragged, zoomed or moved over the stage, it stays parked for the session.
+   * Before this, hover re-armed the idle timer, so the globe could start turning
+   * while the pointer rested on a country the user was reading.
+   */
+  const takeOver = useCallback(() => {
+    if (interacted.current) return;
+    interacted.current = true;
+    stopIdleSpin();
+  }, [stopIdleSpin]);
+
   // Idle spin only ever applies to an *unselected* globe. A selection parks it
-  // permanently: the user is reading that country's chart and a rotating globe
-  // yanks the country out from under the header readout.
+  // permanently: the user is reading that country's chart, and a rotating globe
+  // would yank the country out from under the header readout.
   const scheduleIdleSpin = useCallback(() => {
-    if (reducedMotion || selectedIso) return;
+    if (reducedMotion || selectedIsoRef.current || interacted.current) return;
     if (idleTimer.current) clearTimeout(idleTimer.current);
     idleTimer.current = setTimeout(() => {
-      // Re-check at fire time: a selection may have happened while we waited.
-      if (!globeRef.current || selectedIsoRef.current) return;
+      // Re-check at fire time: a selection or interaction may have happened
+      // while we waited.
+      if (!globeRef.current || selectedIsoRef.current || interacted.current) return;
       setSpinning(true);
     }, IDLE_SPIN_DELAY_MS);
-  }, [reducedMotion, selectedIso, setSpinning]);
+  }, [reducedMotion, setSpinning]);
 
-  // A selection parks the globe, permanently. Dragging still works — only the
-  // idle rotation is disabled, since that is the part that fights the panel.
   useEffect(() => {
-    if (selectedIso) {
-      if (idleTimer.current) clearTimeout(idleTimer.current);
-      setSpinning(false);
+    if (!sceneReady) return;
+    if (selectedIso || reducedMotion || interacted.current) {
+      stopIdleSpin();
       return;
     }
-    if (reducedMotion) return;
     scheduleIdleSpin();
     return () => {
       if (idleTimer.current) clearTimeout(idleTimer.current);
     };
-  }, [selectedIso, reducedMotion, setSpinning, scheduleIdleSpin]);
+  }, [sceneReady, selectedIso, reducedMotion, scheduleIdleSpin, stopIdleSpin]);
+
+  // Device-pixel-ratio changes (browser zoom, moving between displays) do not
+  // resize the CSS box, so ResizeObserver never sees them. Re-assert the pixel
+  // ratio here; three's `setPixelRatio` re-runs `setSize` with the current size.
+  useEffect(() => {
+    if (!sceneReady) return;
+    try {
+      globeRef.current?.renderer?.()?.setPixelRatio(dimensions.dpr);
+    } catch {
+      /* renderer not ready */
+    }
+  }, [sceneReady, dimensions.dpr]);
 
   // ------------------------------------------------------------------ camera
   const tuneControls = useCallback(() => {
@@ -306,12 +379,25 @@ export default function GlobeView({
 
   const handleReady = useCallback(() => {
     tuneControls();
-    setSpinning(!selectedIso && !reducedMotion);
     setSceneReady(true);
     // Debug hook: lets console probes inspect the three scene (draw calls, mesh
     // counts, manual raycasts). Harmless in prod.
     (window as unknown as { __globe?: unknown }).__globe = globeRef.current;
-  }, [selectedIso, reducedMotion, setSpinning, tuneControls]);
+  }, [tuneControls]);
+
+  /**
+   * The sphere itself: a matte, unlit surface.
+   *
+   * `MeshBasicMaterial` is deliberately unaffected by the scene's ambient and
+   * directional lights — no specular, no terminator, no atmosphere shell, no
+   * night-lights texture and no starfield behind it. One flat tone is the whole
+   * globe; the caps and the hairline border layer carry every signal.
+   */
+  const sphereMaterial = useMemo(
+    () => new MeshBasicMaterial({ color: palette.sphere }),
+    [palette.sphere]
+  );
+  useEffect(() => () => sphereMaterial.dispose(), [sphereMaterial]);
 
   /**
    * Fly the camera to the focused country.
@@ -344,9 +430,14 @@ export default function GlobeView({
    *
    * Driven imperatively on `camera.setViewOffset` rather than through the prop,
    * because the prop carries a single frame's value and there is no way to hand it
-   * a tween. Each frame overwrites the last, and nothing else touches the view
-   * offset — three-globe only clears it when the `globeOffset` prop changes, and
-   * that prop is no longer passed. `easeOutCubic` matches `pointOfView`'s feel.
+   * a tween. `easeOutCubic` matches `pointOfView`'s feel.
+   *
+   * One other writer exists: three-render-objects applies the `globeOffset`
+   * default (`[0, 0]`) once while the scene initialises, which calls
+   * `clearViewOffset` on the camera. That lands around — sometimes just after —
+   * `onGlobeReady`, so `sceneReady` alone loses the race and leaves the globe
+   * centred under the panel. `interactive` is the last startup handshake, so the
+   * offset is re-asserted there too.
    */
   const offsetShown = useRef<[number, number]>(offset);
   const offsetRaf = useRef(0);
@@ -398,7 +489,7 @@ export default function GlobeView({
     return () => {
       if (offsetRaf.current) cancelAnimationFrame(offsetRaf.current);
     };
-  }, [offset, sceneReady, reducedMotion, dimensions]);
+  }, [offset, sceneReady, interactive, reducedMotion, dimensions]);
 
   // ------------------------------------------------------------ border layer
   // One LineSegments for every border in the map: a single draw call, full
@@ -659,14 +750,43 @@ export default function GlobeView({
    * a scene traverse is ~0.05ms, and it stops as soon as there is work to do.
    */
   useEffect(() => {
-    if (!sceneReady) return;
+    if (!sceneReady || countries.length === 0) {
+      setInteractive(false);
+      return;
+    }
     let tries = 0;
-    const id = setInterval(() => {
+    let id: ReturnType<typeof setInterval> | null = null;
+    const paint = () => {
       tries += 1;
-      if (applyHoverVisuals() > 0 || tries > 60) clearInterval(id);
-    }, 100);
-    return () => clearInterval(id);
-  }, [sceneReady, applyHoverVisuals]);
+      if (applyHoverVisuals() > 0) {
+        setInteractive(true);
+        if (id) clearInterval(id);
+      } else if (tries > 60) {
+        if (id) clearInterval(id);
+      }
+    };
+    id = setInterval(paint, 100);
+    paint();
+    return () => {
+      if (id) clearInterval(id);
+    };
+  }, [sceneReady, countries, applyHoverVisuals]);
+
+  /**
+   * Hand the scene over exactly once.
+   *
+   * `interactive` is the honest point of readiness: the renderer exists, the
+   * country caps have actually been built, and a raycast can resolve a country.
+   * The route keeps its loading copy up until this fires, and the canvas stays
+   * `pointer-events-none` until then, so a tap during startup is never silently
+   * dropped on a half-built scene.
+   */
+  const reportedInteractive = useRef(false);
+  useEffect(() => {
+    if (!interactive || reportedInteractive.current) return;
+    reportedInteractive.current = true;
+    onInteractive?.();
+  }, [interactive, onInteractive]);
 
   // Borders own the outline; three-globe's per-country strokes would cost a draw
   // call each and duplicate what the merged layer already draws crisply.
@@ -687,9 +807,9 @@ export default function GlobeView({
   // counts only if it is in front of the globe's surface (surfaceDistance), and
   // hits come back sorted near→far so the first surviving cap is the answer.
   //
-  // Only the caps are raycast. The atmosphere shell, the merged 120k-vertex
-  // border layer, the graticules and the star field are all transparent to the
-  // pointer by design — including them cost 2ms per pick, versus 0.09ms here.
+  // Only the caps are raycast. The merged 120k-vertex border layer and the
+  // globe's own sphere are transparent to the pointer by design — including
+  // them cost 2ms per pick, versus 0.09ms here.
   const pickAt = useCallback((clientX: number, clientY: number): StageCountry | null => {
     const p = picker.current;
     const g = globeRef.current;
@@ -736,10 +856,9 @@ export default function GlobeView({
       applyHoverVisuals();
       if (picker.current) picker.current.el.style.cursor = c ? "pointer" : "";
       onHover(c);
-      if (c) scheduleIdleSpin();
       return true;
     },
-    [onHover, applyHoverVisuals, scheduleIdleSpin]
+    [onHover, applyHoverVisuals]
   );
 
   useEffect(() => {
@@ -748,11 +867,16 @@ export default function GlobeView({
     const el = g?.renderer?.()?.domElement as HTMLCanvasElement | undefined;
     if (!el) return;
     picker.current = { el, scene: g.scene(), caps: [], capsScannedAt: 0, rc: new Raycaster(), ndc: new Vector2() };
+    // three-render-objects sets the canvas size in CSS pixels; `display: block`
+    // removes the inline-baseline strip that would otherwise show the stage
+    // through below the canvas.
+    el.style.display = "block";
 
     let downAt: { x: number; y: number } | null = null;
     let dragged = false;
 
     const onMove = (e: PointerEvent) => {
+      takeOver();
       if (downAt && Math.hypot(e.clientX - downAt.x, e.clientY - downAt.y) > 4) dragged = true;
       pointer.current = { x: e.clientX, y: e.clientY };
       if (dragged) {
@@ -764,6 +888,7 @@ export default function GlobeView({
       schedulePick();
     };
     const onDown = (e: PointerEvent) => {
+      takeOver();
       downAt = { x: e.clientX, y: e.clientY };
       dragged = false;
     };
@@ -798,6 +923,9 @@ export default function GlobeView({
     el.addEventListener("pointerup", onUp);
     el.addEventListener("pointercancel", onLeave);
     el.addEventListener("pointerleave", onLeave);
+    // OrbitControls emits `start` for a drag and for a wheel zoom, which covers
+    // both gestures that should end the idle rotation.
+    g.controls()?.addEventListener("start", takeOver);
     g.controls()?.addEventListener("change", onCameraChange);
     return () => {
       el.removeEventListener("pointermove", onMove);
@@ -805,11 +933,12 @@ export default function GlobeView({
       el.removeEventListener("pointerup", onUp);
       el.removeEventListener("pointercancel", onLeave);
       el.removeEventListener("pointerleave", onLeave);
+      g.controls()?.removeEventListener("start", takeOver);
       g.controls()?.removeEventListener("change", onCameraChange);
       picker.current = null;
       if (pickRaf.current) cancelAnimationFrame(pickRaf.current);
     };
-  }, [sceneReady, commitHover, pickAt, onSelect]);
+  }, [sceneReady, commitHover, pickAt, onSelect, takeOver]);
 
   /** Run the pick on the next frame. Idempotent — many callers, one raycast. */
   function schedulePick() {
@@ -822,53 +951,44 @@ export default function GlobeView({
     });
   }
 
-  const rings = useMemo(() => {
-    const sel = countries.find((c) => c.iso === selectedIso);
-    return sel ? [{ lat: sel.lat, lng: sel.lng, maxR: 7, speed: 2.4, period: 1700 }] : [];
-  }, [countries, selectedIso]);
-
-  if (!mounted) return <Stage />;
-
   return (
-    <Suspense fallback={<Stage />}>
-      <Globe
-        ref={globeRef}
-        width={dimensions.w}
-        height={dimensions.h}
-        globeImageUrl="/textures/earth-night.jpg"
-        backgroundImageUrl="/textures/night-sky.png"
-        backgroundColor="rgba(0,0,0,0)"
-        atmosphereColor={palette.atmosphere}
-        atmosphereAltitude={0.16}
-        onGlobeReady={handleReady}
-        // Interaction layer: pruned caps, no side walls, no per-country strokes.
-        polygonsData={countries}
-        polygonGeoJsonGeometry="geometry"
-        polygonAltitude={getAltitude}
-        polygonCapColor={getCapColor}
-        polygonSideColor={noSide}
-        polygonStrokeColor={noStroke}
-        polygonLabel={getLabel}
-        polygonsTransitionDuration={reducedMotion ? 0 : 200}
-        // We raycast the scene ourselves (see pickAt) — three-render-objects'
-        // filter cannot express "stop at the sphere", which is what keeps it
-        // from picking countries on the far side of the planet.
-        enablePointerInteraction={false}
-        // Detail layer: every 50m border, one object, one draw call.
-        customLayerData={borderData}
-        customThreeObject={createBorderLayer}
-        // Selection pulse.
-        ringsData={rings}
-        ringColor={() => palette.capHover}
-        ringMaxRadius="maxR"
-        ringPropagationSpeed="speed"
-        ringRepeatPeriod="period"
-      />
-    </Suspense>
+    <div ref={stageRef} className="absolute inset-0 overflow-hidden">
+      {/* The canvas is inert until caps exist — the route's loading copy stays
+          up until the matching `onInteractive`, so nothing a visitor does during
+          startup can land on a half-built scene and vanish. */}
+      {mounted && dimensions.w > 0 ? (
+        <div className={`absolute inset-0 ${interactive ? "" : "pointer-events-none"}`}>
+          <Suspense fallback={null}>
+            <Globe
+              ref={globeRef}
+              width={dimensions.w}
+              height={dimensions.h}
+              // Matte and unlit: a flat sphere with no texture, no atmosphere
+              // shell, no starfield behind it and no decorative rings.
+              globeMaterial={sphereMaterial}
+              showAtmosphere={false}
+              backgroundColor="rgba(0,0,0,0)"
+              onGlobeReady={handleReady}
+              // Interaction layer: pruned caps, no side walls, no per-country strokes.
+              polygonsData={countries}
+              polygonGeoJsonGeometry="geometry"
+              polygonAltitude={getAltitude}
+              polygonCapColor={getCapColor}
+              polygonSideColor={noSide}
+              polygonStrokeColor={noStroke}
+              polygonLabel={getLabel}
+              polygonsTransitionDuration={reducedMotion ? 0 : 200}
+              // We raycast the scene ourselves (see pickAt) — three-render-objects'
+              // filter cannot express "stop at the sphere", which is what keeps it
+              // from picking countries on the far side of the planet.
+              enablePointerInteraction={false}
+              // Detail layer: every 50m border, one object, one draw call.
+              customLayerData={borderData}
+              customThreeObject={createBorderLayer}
+            />
+          </Suspense>
+        </div>
+      ) : null}
+    </div>
   );
-}
-
-/** Pre-hydration / pre-import placeholder that still reads as the stage. */
-function Stage() {
-  return <div className="absolute inset-0 bg-void" />;
 }

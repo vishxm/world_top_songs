@@ -53,7 +53,11 @@ const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
 const pageErrors = [];
 page.on("pageerror", (e) => pageErrors.push(String(e)));
 page.on("console", (m) => {
-  if (m.type() === "error") pageErrors.push(m.text().slice(0, 160));
+  // Chromium's own permissions-policy warning from the embedded YouTube iframe
+  // is environment noise, not an app error.
+  if (m.type() === "error" && !/Permissions policy violation/.test(m.text())) {
+    pageErrors.push(m.text().slice(0, 160));
+  }
 });
 
 // Record which Media Session actions the app subscribes to.
@@ -84,23 +88,93 @@ await page.addInitScript(() => {
 stage("opening " + URL_);
 await page.goto(URL_, { waitUntil: "networkidle" });
 await page.waitForFunction(() => !!window.__globe, null, { timeout: 30_000 });
-await page.waitForTimeout(2500);
+// The loading copy hands over exactly when the caps exist, so this is also the
+// point at which picking is live. Wait for the handover rather than guessing a
+// duration, then let the one-shot crossfade finish.
+await page.waitForFunction(
+  () => {
+    const el = document.querySelector("#stage-loading");
+    return el?.getAttribute("aria-hidden") === "true" && getComputedStyle(el).opacity === "0";
+  },
+  null,
+  { timeout: 30_000 }
+);
 stage("globe ready");
 
-// Park the globe. It idles with autoRotate on, and a rotating globe invalidates
-// every sample point between measuring and hovering.
-await page.evaluate(() => {
-  window.__globe.controls().autoRotate = false;
+// ---------------------------------------------------------------------------
+// 0a. The stage itself: the canvas fills its box at the right pixel ratio, the
+//     sphere is matte and unlit, and the loading state has handed over.
+// ---------------------------------------------------------------------------
+const stageProbe = await page.evaluate(() => {
+  const canvas = document.querySelector('section[aria-label="World globe"] canvas');
+  const section = canvas?.closest("section");
+  const box = section?.getBoundingClientRect();
+  const rect = canvas?.getBoundingClientRect();
+  const globe = { unlit: false, textured: false };
+  let atmosphereVisible = 0;
+  let rings = 0;
+  window.__globe.scene().traverse((o) => {
+    if (o.__globeObjType === "atmosphere" && o.visible) atmosphereVisible++;
+    if (o.__globeObjType === "ring") rings++;
+    if (o.__globeObjType === "globe") {
+      for (const child of o.children) {
+        if (!child.isMesh) continue;
+        globe.unlit = child.material?.type === "MeshBasicMaterial";
+        globe.textured = !!child.material?.map;
+      }
+    }
+  });
+  const loader = document.querySelector("#stage-loading");
+  return {
+    canvas: rect && { w: +rect.width.toFixed(1), h: +rect.height.toFixed(1) },
+    stage: box && { w: +box.width.toFixed(1), h: +box.height.toFixed(1) },
+    buffer: canvas && { w: canvas.width, h: canvas.height },
+    dpr: Math.min(2, window.devicePixelRatio || 1),
+    atmosphereVisible,
+    rings,
+    globe,
+    loader: loader
+      ? { hidden: loader.getAttribute("aria-hidden"), opacity: +getComputedStyle(loader).opacity }
+      : null,
+  };
 });
+check(
+  "the canvas fills the stage box",
+  !!stageProbe.canvas &&
+    !!stageProbe.stage &&
+    Math.abs(stageProbe.canvas.w - stageProbe.stage.w) <= 1 &&
+    Math.abs(stageProbe.canvas.h - stageProbe.stage.h) <= 1,
+  `canvas ${stageProbe.canvas?.w}x${stageProbe.canvas?.h}, stage ${stageProbe.stage?.w}x${stageProbe.stage?.h}`
+);
+check(
+  "the canvas is sized in device pixels",
+  !!stageProbe.buffer &&
+    !!stageProbe.canvas &&
+    Math.abs(stageProbe.buffer.w - stageProbe.canvas.w * stageProbe.dpr) <= 1 &&
+    Math.abs(stageProbe.buffer.h - stageProbe.canvas.h * stageProbe.dpr) <= 1,
+  `buffer ${stageProbe.buffer?.w}x${stageProbe.buffer?.h} at dpr ${stageProbe.dpr}`
+);
+check(
+  "the sphere is matte and unlit, with no atmosphere or rings",
+  stageProbe.globe.unlit &&
+    !stageProbe.globe.textured &&
+    stageProbe.atmosphereVisible === 0 &&
+    stageProbe.rings === 0,
+  `material ${stageProbe.globe.unlit ? "unlit" : "lit"}${stageProbe.globe.textured ? " textured" : ""}, ${stageProbe.atmosphereVisible} atmosphere, ${stageProbe.rings} rings`
+);
+check(
+  "the loading state hands over to the scene",
+  stageProbe.loader?.hidden === "true" && stageProbe.loader.opacity === 0,
+  `aria-hidden=${stageProbe.loader?.hidden} opacity=${stageProbe.loader?.opacity}`
+);
 
 /**
  * The independent oracle, installed in the page.
  *
  * Deliberately a reimplementation of the rule rather than a call into the app:
  * hits sorted near→far, the first country cap wins, and the globe sphere ends the
- * search because everything past it is on the far side of the planet. The
- * atmosphere shell, the merged border layer, the selection outline and the pulse
- * rings are transparent to the pointer by design.
+ * search because everything past it is on the far side of the planet. The merged
+ * border layer and the selection outline are transparent to the pointer by design.
  */
 await page.evaluate(async () => {
   const THREE = await import("/node_modules/three/build/three.module.js");
@@ -737,16 +811,66 @@ check(
   surprises.join(", ")
 );
 
+// ---------------------------------------------------------------------------
+// 13. Idle rotation. A selection deliberately parks the globe, and the first
+//     real interaction ends the invitation for good — so this needs a page that
+//     has never been touched. Closing the chart programmatically keeps the
+//     pointer out of the picture; the only real pointer move is the one that
+//     must stop the spin.
+// ---------------------------------------------------------------------------
+stage("checking idle rotation");
+check(
+  "a selection parks the idle rotation",
+  await page.evaluate(() => window.__globe.controls().autoRotate === false),
+  "autoRotate false after a full run with a country selected"
+);
+
 check("no page errors", pageErrors.length === 0, pageErrors.slice(0, 3).join(" | "));
 
 // The page above has a live player attached; use a clean page for full-document
 // navigations so a media teardown cannot be mistaken for a routing error.
 await page.close();
+
+const idlePage = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+const idleErrors = [];
+idlePage.on("pageerror", (e) => idleErrors.push(String(e)));
+idlePage.on("console", (m) => {
+  if (m.type() === "error" && !/Permissions policy violation/.test(m.text())) {
+    idleErrors.push(m.text().slice(0, 160));
+  }
+});
+await idlePage.goto(`${BASE}/?c=US`, { waitUntil: "networkidle" });
+await idlePage.waitForFunction(
+  () => document.querySelector("#stage-loading")?.getAttribute("aria-hidden") === "true",
+  null,
+  { timeout: 30_000 }
+);
+await idlePage.evaluate(() => document.querySelector('button[aria-label="Close chart"]').click());
+await idlePage.waitForFunction(() => !new URLSearchParams(location.search).get("c"), null, {
+  timeout: 5_000,
+});
+const idleArmed = await idlePage
+  .waitForFunction(() => window.__globe.controls().autoRotate === true, null, { timeout: 10_000 })
+  .then(() => true)
+  .catch(() => false);
+await idlePage.mouse.move(720, 450);
+await idlePage.waitForTimeout(150);
+const idleStopped = await idlePage.evaluate(() => window.__globe.controls().autoRotate === false);
+check(
+  "idle rotation starts after a pause and stops on interaction",
+  idleArmed && idleStopped,
+  `armed ${idleArmed}, stopped ${idleStopped}`
+);
+check("no page errors on the idle page", idleErrors.length === 0, idleErrors.slice(0, 3).join(" | "));
+await idlePage.close();
+
 const routePage = await browser.newPage({ viewport: { width: 1440, height: 900 } });
 const routeErrors = [];
 routePage.on("pageerror", (e) => routeErrors.push(String(e)));
 routePage.on("console", (m) => {
-  if (m.type() === "error") routeErrors.push(m.text().slice(0, 160));
+  if (m.type() === "error" && !/Permissions policy violation/.test(m.text())) {
+    routeErrors.push(m.text().slice(0, 160));
+  }
 });
 
 // ---------------------------------------------------------------------------
