@@ -55,12 +55,17 @@
 //      gives back, the tablet breakpoint is a sheet rather than a rail with the
 //      wrong reserve, and the player docks inside the sheet without covering the
 //      list or the rail — including when only the player is left
+//  26. focus and world view: selecting from a closer camera never moves outward
+//      (the microstates), Escape and a wide empty tap return to the world
+//      altitude while keeping `?c=`, pressing the selected country recentres it,
+//      and a resize after Escape does not re-focus the country
 //
 // Run it against a dev server. Usage: node scripts/globe-pick-check.mjs [url]
 import { chromium } from "playwright";
 import { CHART_ISOS } from "../app/lib/countries.ts";
 import { fmtWeek } from "../app/lib/format.ts";
 import { NO_CHART_REASON } from "../app/lib/chartTypes.ts";
+import { focusAltitude, worldAltitude } from "../app/lib/focus.ts";
 
 const URL_ = process.argv[2] ?? "http://localhost:5173/?c=US";
 const BASE = new URL(URL_).origin;
@@ -3173,13 +3178,22 @@ check(
 
 await sheetPage.close();
 
-// Wide layouts have a rail, not a sheet: no chevron, and an empty tap is just a
-// tap on water.
+// Wide layouts have a rail, not a sheet. Charts are irrelevant to this section
+// and four country selections would otherwise each wait on the upstream, so
+// name whichever country asked — the same stub the prefetch section uses.
 const wideSheetPage = await browser.newPage({
   viewport: { width: 1440, height: 900 },
   reducedMotion: "reduce",
 });
 const wideSheetErrors = watchErrors(wideSheetPage);
+await wideSheetPage.route(/\/api\/charts\?/, (route) => {
+  const country = new URL(route.request().url()).searchParams.get("country") ?? "";
+  return route.fulfill({
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify({ ...usChart.body, country }),
+  });
+});
 await wideSheetPage.goto(`${BASE}/?c=US`, { waitUntil: "domcontentloaded" });
 await wideSheetPage.waitForFunction(
   () => document.querySelectorAll('section[aria-label$="chart"] ol li').length === 20,
@@ -3190,39 +3204,200 @@ await wideSheetPage.waitForFunction(() => !!window.__globe && !!window.__globeHi
   timeout: 30_000,
 });
 await installOracle(wideSheetPage);
-const wideSky = await wideSheetPage.evaluate(() => {
-  for (let y = 150; y < innerHeight - 200; y += 14) {
-    for (let x = 40; x < 700; x += 14) {
-      if (window.__oracle(x, y, innerWidth, innerHeight) === undefined) return { x, y };
+
+// ---------------------------------------------------------------------------
+// 26. Focus and world view.
+//
+//      The pure gate (`scripts/focus-check.mjs`) proves the arithmetic: world is
+//      never closer than focus, and a selection can only move closer. This
+//      section proves the wiring on the named countries from the ticket, plus
+//      the three ways out of a focus: Escape, an empty tap, and a resize after
+//      either.
+//
+//      Reduced motion makes every flight instant, so each assertion reads the
+//      camera after the state has settled rather than after a guessed duration.
+// ---------------------------------------------------------------------------
+stage("checking focus and world view");
+
+const WIDE_LAYOUT = { width: 1440, height: 900, isWide: true, sheetPx: 0 };
+const WORLD = worldAltitude(WIDE_LAYOUT);
+const readPose = () =>
+  wideSheetPage.evaluate(() => {
+    const pose = window.__globe.pointOfView();
+    return {
+      ...pose,
+      c: new URLSearchParams(location.search).get("c"),
+      panel: !!document.querySelector('button[aria-label="Close chart"]'),
+      chevron: !!document.querySelector('button[aria-label="Collapse chart"]'),
+      peek: !!document.querySelector('button[aria-label^="Show the "]'),
+    };
+  });
+const poseAt = (lat, lng, altitude) =>
+  wideSheetPage.evaluate(
+    ([la, ln, alt]) => window.__globe.pointOfView({ lat: la, lng: ln, altitude: alt }, 0),
+    [lat, lng, altitude]
+  );
+/** A pixel the scene's own hit layer attributes to `iso`, near the projected
+ *  centre. The projection alone is a good guess, but a centroid can sit in a
+ *  bay; the oracle makes the click land on the country the check names. */
+const focusPixel = (lat, lng, iso) =>
+  wideSheetPage.evaluate(
+    ([la, ln, want]) => {
+      const centre = window.__screenOf(la, ln);
+      if (!centre) return null;
+      if (window.__oracle(centre[0], centre[1], innerWidth, innerHeight) === want) return centre;
+      for (let r = 3; r <= 30; r += 3) {
+        for (let dy = -r; dy <= r; dy += 3) {
+          for (let dx = -r; dx <= r; dx += 3) {
+            const x = centre[0] + dx;
+            const y = centre[1] + dy;
+            if (window.__oracle(x, y, innerWidth, innerHeight) === want) return [x, y];
+          }
+        }
+      }
+      return centre;
+    },
+    [lat, lng, iso]
+  );
+
+// Selecting a microstate used to resolve to the *farthest* framing: the span
+// formula's "minimum" radius was the smallest globe, so Singapore flew outward.
+// Pose the camera closer than the comfortable focus first, then click the
+// country's centre. The camera may stay where it is, but it must not retreat.
+const MICROSTATES = [
+  { iso: "SG", lat: 1.35, lng: 103.82 },
+  { iso: "HK", lat: 22.32, lng: 114.17 },
+  { iso: "LU", lat: 49.82, lng: 6.13 },
+  { iso: "SV", lat: 13.79, lng: -88.9 },
+];
+for (const c of MICROSTATES) {
+  await poseAt(c.lat, c.lng, 0.5);
+  const before = await readPose();
+  const at = await focusPixel(c.lat, c.lng, c.iso);
+  if (at) await wideSheetPage.mouse.click(at[0], at[1]);
+  await wideSheetPage
+    .waitForFunction(
+      (iso) => new URLSearchParams(location.search).get("c") === iso,
+      c.iso,
+      { timeout: 5_000 }
+    )
+    .catch(() => undefined);
+  await wideSheetPage.waitForTimeout(150);
+  const after = await readPose();
+  check(
+    `selecting ${c.iso} from a closer camera never moves outward`,
+    !!at && after.c === c.iso && after.altitude <= before.altitude + 0.01,
+    at
+      ? `click @${at[0]},${at[1]} -> ?c=${after.c}, altitude ${before.altitude.toFixed(3)} -> ${after.altitude.toFixed(3)}`
+      : "the country centre did not project on screen"
+  );
+}
+
+// Escape is the keyboard way back to the world. The selection, its ring and
+// `?c=` all stay; only the camera moves.
+await poseAt(13.79, -88.9, 0.6);
+await wideSheetPage.keyboard.press("Escape");
+await wideSheetPage.waitForTimeout(200);
+const escapedWorld = await readPose();
+check(
+  "Escape returns to world view and keeps the selection",
+  Math.abs(escapedWorld.altitude - WORLD) < 0.02 &&
+    escapedWorld.c === "SV" &&
+    escapedWorld.panel &&
+    !escapedWorld.chevron,
+  `altitude ${escapedWorld.altitude.toFixed(3)} (world ${WORLD.toFixed(3)}), ?c=${escapedWorld.c}`
+);
+
+// A wide empty tap is the pointer equivalent. Water is a genuine miss — open sky
+// can be hard to find when the globe is close — and both reach `onEmptyTap`.
+await poseAt(13.79, -88.9, 0.6);
+const wideWater = await wideSheetPage.evaluate(() => {
+  for (let y = 150; y < innerHeight - 200; y += 12) {
+    for (let x = 40; x < 980; x += 12) {
+      const hit = window.__oracle(x, y, innerWidth, innerHeight);
+      if (hit === null || hit === undefined) return { x, y, kind: hit === null ? "water" : "sky" };
     }
   }
   return null;
 });
-if (wideSky) await wideSheetPage.mouse.click(wideSky.x, wideSky.y);
-await wideSheetPage.waitForTimeout(600);
-const wideSheet = await wideSheetPage.evaluate(() => ({
-  chevron: !!document.querySelector('button[aria-label="Collapse chart"]'),
-  peek: !!document.querySelector('button[aria-label^="Show the "]'),
-  panel: !!document.querySelector('button[aria-label="Close chart"]'),
-  c: new URLSearchParams(location.search).get("c"),
-  // The rail occupies 384px plus the gutter on the right; the camera shifts left
-  // by half that footprint. This is the wide half of the same geometry rule.
-  cameraX: window.__globe?.camera?.()?.view?.offsetX ?? null,
-}));
+if (wideWater) await wideSheetPage.mouse.click(wideWater.x, wideWater.y);
+await wideSheetPage.waitForTimeout(250);
+const wideSheet = await readPose();
 check(
-  "a wide layout has no fold, and an empty tap folds nothing",
-  !!wideSky &&
+  "a wide layout has no fold, and an empty tap returns to world view",
+  !!wideWater &&
     !wideSheet.chevron &&
     !wideSheet.peek &&
     wideSheet.panel &&
-    wideSheet.c === "US" &&
-    wideSheet.cameraX !== null &&
-    Math.abs(wideSheet.cameraX - (384 + 48) / 2) < 1,
-  wideSky
-    ? `sky @${wideSky.x},${wideSky.y} -> chevron ${wideSheet.chevron}, peek ${wideSheet.peek}, ` +
-      `?c=${wideSheet.c}, camera offsetX ${wideSheet.cameraX}`
-    : "no open-sky pixel"
+    wideSheet.c === "SV" &&
+    Math.abs(wideSheet.altitude - WORLD) < 0.02,
+  wideWater
+    ? `${wideWater.kind} @${wideWater.x},${wideWater.y} -> chevron ${wideSheet.chevron}, ` +
+      `?c=${wideSheet.c}, altitude ${wideSheet.altitude.toFixed(3)} (world ${WORLD.toFixed(3)})`
+    : "no water pixel on the stage"
 );
+check(
+  "the wide empty tap leaves the camera offset beside the rail",
+  await wideSheetPage.evaluate(
+    () => Math.abs((window.__globe?.camera?.()?.view?.offsetX ?? 0) - (384 + 48) / 2) < 1
+  ),
+  "the rail still owns its half of the stage"
+);
+
+// Pressing the country that is already selected is a recentre, not a no-op:
+// pan the camera away first, then click the selected country's centre.
+await poseAt(32, -70, 0.7);
+const panBefore = await readPose();
+const svAt = await focusPixel(13.79, -88.9, "SV");
+if (svAt) await wideSheetPage.mouse.click(svAt[0], svAt[1]);
+await wideSheetPage.waitForTimeout(250);
+const recentred = await readPose();
+check(
+  "clicking the selected country recentres it",
+  !!svAt &&
+    recentred.c === "SV" &&
+    recentred.altitude <= panBefore.altitude + 0.01 &&
+    Math.abs(recentred.lat - 13.79) < 1 &&
+    Math.abs(recentred.lng + 88.9) < 1,
+  svAt
+    ? `pan ${panBefore.lat.toFixed(1)},${panBefore.lng.toFixed(1)} -> ` +
+      `${recentred.lat.toFixed(1)},${recentred.lng.toFixed(1)} at ${recentred.altitude.toFixed(3)}`
+    : "the selected country did not project on screen"
+);
+
+// Escape, then resize. A layout re-frame is allowed to move the camera exactly
+// to its target, but while `worldView` holds that target is the world — a resize
+// must not quietly re-focus the country the user just zoomed out of.
+await wideSheetPage.keyboard.press("Escape");
+await wideSheetPage.waitForTimeout(150);
+await wideSheetPage.setViewportSize({ width: 1200, height: 800 });
+await wideSheetPage.waitForTimeout(350);
+const resized = await readPose();
+const resizedWorld = worldAltitude({ width: 1200, height: 800, isWide: true, sheetPx: 0 });
+check(
+  "a resize after Escape stays at world view",
+  Math.abs(resized.altitude - resizedWorld) < 0.02 && resized.c === "SV",
+  `altitude ${resized.altitude.toFixed(3)} (world ${resizedWorld.toFixed(3)}), ?c=${resized.c}`
+);
+
+// And a selection still leaves world view: the same country, now at a world
+// altitude, must move to the comfortable focus rather than staying out.
+const afterResizeAt = await focusPixel(13.79, -88.9, "SV");
+if (afterResizeAt) await wideSheetPage.mouse.click(afterResizeAt[0], afterResizeAt[1]);
+await wideSheetPage.waitForTimeout(250);
+const refocused = await readPose();
+const resizedFocus = focusAltitude({ width: 1200, height: 800, isWide: true, sheetPx: 0 });
+check(
+  "selecting after a world reset returns to the country focus",
+  !!afterResizeAt &&
+    refocused.c === "SV" &&
+    Math.abs(refocused.altitude - resizedFocus) < 0.02 &&
+    resizedFocus < resizedWorld,
+  afterResizeAt
+    ? `altitude ${refocused.altitude.toFixed(3)} (focus ${resizedFocus.toFixed(3)}, world ${resizedWorld.toFixed(3)})`
+    : "the country did not project on screen after the resize"
+);
+
 check(
   "no page errors on the wide sheet page",
   wideSheetErrors.length === 0,

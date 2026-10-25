@@ -17,18 +17,21 @@ import { useReducedMotion, useStoredState } from "~/hooks/usePrefs";
 import { useGlobePalette } from "~/hooks/useGlobePalette";
 import type { Region } from "~/lib/countryMeta";
 import { countryName, countryRegion, isKnownCountry } from "~/lib/countryMeta";
+import {
+  focusAltitude,
+  worldAltitude,
+  type FocusKind,
+  type FocusLayout,
+  GUTTER,
+  HEADER_CLEARANCE,
+  PANEL_WIDTH,
+} from "~/lib/focus";
 
-const PANEL_WIDTH = 384;
-const GUTTER = 48;
 /** The one layout breakpoint: the chart is a bottom sheet below it and a right
  *  rail at or above it. It matches Tailwind's `lg` and the CSS that owns
  *  `--sheet-h` — a second threshold here is how the tablet layout ended up with
  *  a full-height rail positioned by a phone's sheet reserve. */
 const WIDE_MIN_PX = 1024;
-/** Vertical space the header occupies on narrow screens; the globe centres in
- *  what is left. Matches Header.tsx's two-row mobile layout. */
-const HEADER_CLEARANCE = 118;
-const FOV_TAN = Math.tan((50 / 2) * (Math.PI / 180)); // three-globe's fixed 50° fov
 
 /**
  * Stable empty layers for the window between mount and the map arriving.
@@ -43,56 +46,16 @@ const EMPTY_PARTS: LandPart[] = [];
 
 type RecoveryNotice = { message: string; iso: string };
 
-/**
- * Camera altitude (1 + distance/radius) that makes the globe fill `targetRadius`
- * pixels. Solved from the projection rather than hand-tuned, so it stays correct
- * at any viewport size.
- */
-function altitudeForRadius(viewportH: number, targetRadius: number): number {
-  return viewportH / 2 / (targetRadius * FOV_TAN) - 1;
-}
-
-/**
- * Wide layouts frame an individual country, so the altitude follows the country's
- * angular size — but the globe's *near* edge must stay clear of the right rail,
- * since that is where the selected country ends up. Fitting the near limb inside
- * the stage is what stops the focus from hiding under the panel.
- *
- * Narrow layouts cannot zoom in at all: the globe shares the screen with the
- * sheet and header, so it gets one fixed radius that fills the clear band, and
- * the selected country is found by spinning rather than by framing.
- *
- * `sheetPx` is the sheet's height in px, not a fraction: it changes when the
- * sheet is collapsed, and the globe has to grow into whatever is left. It is
- * read from `--sheet-h`, the same variable that sizes the sheet and lifts the
- * rail, so the camera cannot disagree with the layout about how much room it has.
- */
-function altitudeForViewport(
-  span: number,
-  isWide: boolean,
-  width: number,
-  viewportH: number,
-  sheetPx: number
-): number {
-  if (width <= 0 || viewportH <= 0) return 2.5;
-  if (!isWide) {
-    // Fit the clear band above the sheet, not the whole screen: the globe should
-    // read as a full disc in the space the user can actually see.
-    const clearBand = viewportH - sheetPx - HEADER_CLEARANCE;
-    const target = Math.min(width * 0.47, clearBand * 0.5);
-    return Math.max(2.4, altitudeForRadius(viewportH, target));
-  }
-  const stageWidth = width - (PANEL_WIDTH + GUTTER);
-  // Zoom out far enough that the whole sphere stays inside the stage, then zoom
-  // back in as far as the country's own size allows — so a city-state fills the
-  // stage while Russia still fits, instead of one fixed compromise for both.
-  const fitRadius = Math.min(stageWidth * 0.6, viewportH * 0.46);
-  const minRadius = Math.min(stageWidth * 0.2, viewportH * 0.14);
-  const maxRadius = Math.min(stageWidth * 0.62, viewportH * 0.46);
-  // Radius that would frame the country, then clamp it into the stage.
-  const wanted = ((span / 2.2) * FOV_TAN * viewportH) / 2;
-  return altitudeForRadius(viewportH, Math.min(fitRadius, Math.max(minRadius, Math.min(maxRadius, wanted))));
-}
+/** A camera request. `altitude` is the framing the route *wants*; GlobeView
+ *  resolves it against the live camera and the kind before flying, so a
+ *  selection can only ever move closer. */
+type FocusRequest = {
+  lat: number;
+  lng: number;
+  altitude: number;
+  n: number;
+  kind: FocusKind;
+};
 
 export default function Home() {
   const [params, setParams] = useSearchParams();
@@ -128,7 +91,16 @@ export default function Home() {
 
   const [hovered, setHovered] = useState<StageCountry | null>(null);
   const [regionFilter, setRegionFilter] = useState<Region | null>(null);
-  const [focus, setFocus] = useState<{ lat: number; lng: number; altitude: number; n: number } | null>(null);
+  const [focus, setFocus] = useState<FocusRequest | null>(null);
+  /** True after Escape or a wide empty tap. While it holds, a layout change
+   *  (fold, resize) re-frames the *world*, not the selected country — otherwise
+   *  resizing the window would undo the world view the user just asked for. */
+  const [worldView, setWorldView] = useState(false);
+  /** Escape/empty-tap requests, and re-clicks of the current selection. Counters
+   *  rather than booleans so pressing the same action twice still moves the
+   *  camera twice. */
+  const [worldResetN, setWorldResetN] = useState(0);
+  const [recentreN, setRecentreN] = useState(0);
   const [activeIndex, setActiveIndex] = useState<number | null>(null);
   /** The player's transport, so pressing the row that is already playing is a
    *  pause/resume instead of a dead click (or a restart from zero). */
@@ -266,8 +238,13 @@ export default function Home() {
       // folded, the tap would light the country up on the globe and appear to do
       // nothing at all, because the list it was asking for is hidden.
       setSheetFolded(false);
+      // A selection is a deliberate return from world view. The effect below
+      // sees the ISO change; pressing the country that is already selected
+      // changes nothing in the URL, so it needs its own counter to recentre.
+      setWorldView(false);
+      if (c.iso === selectedIso) setRecentreN((n) => n + 1);
     },
-    [patchParams, setStoredIso]
+    [patchParams, selectedIso, setStoredIso]
   );
 
   const changeTab = useCallback((k: ChartKind) => patchParams({ kind: k }), [patchParams]);
@@ -525,28 +502,93 @@ export default function Home() {
   // The camera follows the selection, whichever way it changed — globe click,
   // picker, URL deep link, or the back button.
   //
-  // Keyed on the reserved sheet height as well as the country, because folding the
-  // sheet changes the clear band and the globe has to re-frame into it. Re-firing
-  // `pointOfView` with the SAME lat/lng and a new altitude is what makes the fold
-  // read as the globe growing into the space it just got, rather than the camera
-  // sitting in a sliver it no longer has.
-  const focusedKey = useRef<string | null>(null);
-  useEffect(() => {
-    if (!selected) return;
-    const key = `${selected.iso}@${Math.round(sheetReserve)}@${isWide ? "w" : "n"}`;
-    if (focusedKey.current === key) return;
-    focusedKey.current = key;
-    setFocus({
-      lat: selected.lat,
-      lng: selected.lng,
-      altitude: altitudeForViewport(selected.span, isWide, viewport.w, viewport.h, sheetReserve),
-      n: Date.now(),
-    });
-  }, [selected, viewport.w, viewport.h, isWide, sheetReserve]);
+  // The framing itself is fixed (`app/lib/focus.ts`): one comfortable distance
+  // for a country and one for the whole world. A selection resolves against the
+  // *live* camera altitude inside GlobeView, so it can move closer or stay but
+  // never farther — which is what fixes the microstates flying outward.
+  //
+  // Layout is still an input: folding the sheet or resizing changes the space
+  // the globe has, and the camera re-frames into it. `worldView` is what keeps
+  // that re-frame from undoing an Escape: after a world reset, a resize wants
+  // the world altitude, not the selected country's.
+  const worldViewRef = useRef(false);
+  /** Last lat/lng the camera was sent to, so Escape can return to world view
+   *  even when the chart has been closed and no country is selected. */
+  const focusAnchor = useRef({ lat: 0, lng: 0 });
+  const lastSelection = useRef<string | null>(null);
+  const lastLayout = useRef("");
+  const lastRecentre = useRef(0);
+  const lastWorldReset = useRef(0);
+  const focusN = useRef(0);
 
   useEffect(() => {
-    if (!selectedIso) focusedKey.current = null;
-  }, [selectedIso]);
+    const layout: FocusLayout = {
+      width: viewport.w,
+      height: viewport.h,
+      isWide,
+      sheetPx: sheetReserve,
+    };
+    const iso = selected?.iso ?? null;
+    const selectionChanged = iso !== lastSelection.current;
+    const recentre = recentreN !== lastRecentre.current;
+    const worldReset = worldResetN !== lastWorldReset.current;
+    const layoutKey = `${viewport.w}x${viewport.h}:${isWide ? "w" : "n"}:${Math.round(sheetReserve)}`;
+    const layoutChanged = layoutKey !== lastLayout.current;
+
+    // With no country selected there is no framing to derive from the layout —
+    // the offset still follows the sheet, but the camera stays where it is. The
+    // one exception is an explicit world reset.
+    if (!iso && !worldReset) {
+      lastSelection.current = null;
+      return;
+    }
+    if (iso && !selectionChanged && !recentre && !worldReset && !layoutChanged) return;
+
+    let kind: FocusKind;
+    if (iso && (selectionChanged || recentre)) {
+      // A selection wins over world view. Pressing the country that is already
+      // selected changes no URL, so it arrives as a recentre.
+      kind = selectionChanged ? "select" : "recentre";
+      worldViewRef.current = false;
+      if (worldView) setWorldView(false);
+    } else if (worldReset) {
+      kind = "world";
+    } else {
+      kind = worldViewRef.current ? "world" : "layout";
+    }
+
+    const wanted = kind === "world" ? worldAltitude(layout) : focusAltitude(layout);
+    const anchor = selected ? { lat: selected.lat, lng: selected.lng } : focusAnchor.current;
+    focusAnchor.current = anchor;
+    lastSelection.current = iso;
+    lastLayout.current = layoutKey;
+    lastRecentre.current = recentreN;
+    lastWorldReset.current = worldResetN;
+    focusN.current += 1;
+    setFocus({ ...anchor, altitude: wanted, n: focusN.current, kind });
+  }, [selected, viewport.w, viewport.h, isWide, sheetReserve, recentreN, worldResetN, worldView]);
+
+  /** Escape and a wide empty tap both mean "show me the whole world". The
+   *  selection — its ring and `?c=` — deliberately stays. */
+  const resetWorldView = useCallback(() => {
+    worldViewRef.current = true;
+    setWorldView(true);
+    setWorldResetN((n) => n + 1);
+  }, []);
+
+  // Escape is the keyboard way back to the world. Dialogs own Escape: the
+  // picker closes and an open video collapses, so resetting the camera
+  // underneath either would be a second, invisible action.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape" || e.defaultPrevented) return;
+      if (document.querySelector('[role="dialog"][aria-modal="true"]')) return;
+      if (document.querySelector('[data-video-open="true"]')) return;
+      resetWorldView();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [resetWorldView]);
 
   const surprise = useCallback(() => {
     const pool = CHART_ISOS.filter((iso) => byIso.has(iso));
@@ -661,7 +703,7 @@ export default function Home() {
           onHover={setHovered}
           onSelect={select}
           onMotionChange={handleGlobeMotion}
-          onEmptyTap={isWide ? undefined : foldFromStage}
+          onEmptyTap={isWide ? resetWorldView : foldFromStage}
           onInteractive={handleGlobeInteractive}
         />
       </section>

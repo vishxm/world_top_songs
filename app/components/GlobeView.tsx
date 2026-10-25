@@ -23,6 +23,7 @@ import {
 import type { Region } from "~/lib/countryMeta";
 import type { LandPart } from "~/lib/mapData";
 import type { GlobePalette } from "~/hooks/useGlobePalette";
+import { resolveFocus, type FocusKind } from "~/lib/focus";
 
 // react-globe.gl touches `window` at import time, so it must never load during
 // SSR: lazy() defers the import until the first client render and we only render
@@ -189,7 +190,7 @@ interface Props {
   landParts: readonly LandPart[];
   selectedIso: string | null;
   hoverIso: string | null;
-  focus: { lat: number; lng: number; altitude: number; n: number } | null;
+  focus: { lat: number; lng: number; altitude: number; n: number; kind: FocusKind } | null;
   /** Screen-space nudge so the globe centres in the area the panel leaves free. */
   offset: [number, number];
   reducedMotion: boolean;
@@ -214,11 +215,12 @@ interface Props {
   onInteractive?: () => void;
   /**
    * A tap that landed on the globe but hit no country — ocean, sky, or the space
-   * around the planet. On narrow layouts the route uses this to fold the chart
-   * sheet away, so the globe can be seen without deselecting the country.
+   * around the planet.
    *
-   * Fires on `pointerup` only when the press was not a drag, so spinning the globe
-   * never folds anything. Undefined on wide layouts, where there is no sheet.
+   * The route splits it by layout: narrow folds the chart sheet away (so the
+   * globe can be seen without deselecting the country), wide returns to world
+   * view. Fires on `pointerup` only when the press was not a drag, so spinning
+   * the globe never triggers either.
    */
   onEmptyTap?: () => void;
 }
@@ -471,7 +473,13 @@ export default function GlobeView({
   useEffect(() => () => sphereMaterial.dispose(), [sphereMaterial]);
 
   /**
-   * Fly the camera to the focused country.
+   * Fly the camera to the requested framing.
+   *
+   * The route sends the altitude it *wants*; the actual altitude comes from the
+   * live camera, because a drag, a wheel zoom or a flight still in progress all
+   * change it without the route knowing. `resolveFocus` is the rule: a selection
+   * or a recentre may move closer or stay, never farther; a world reset and a
+   * layout re-frame take their target exactly.
    *
    * Gated on `sceneReady` as well as `focus`, because the two arrive in either
    * order: the Globe is lazy and its texture is async, so on a deep link
@@ -484,8 +492,13 @@ export default function GlobeView({
     if (!sceneReady || !focus || !globeRef.current) return;
     if (appliedFocusN.current === focus.n) return;
     appliedFocusN.current = focus.n;
+    const current = globeRef.current.pointOfView?.()?.altitude;
     globeRef.current.pointOfView(
-      { lat: focus.lat, lng: focus.lng, altitude: focus.altitude },
+      {
+        lat: focus.lat,
+        lng: focus.lng,
+        altitude: resolveFocus(current, focus.altitude, focus.kind),
+      },
       reducedMotion ? 0 : 1150
     );
   }, [focus, sceneReady, reducedMotion]);

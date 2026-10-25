@@ -514,6 +514,20 @@ export default function NowPlaying({
   }, [fitPlayer]);
 
   /**
+   * Escape collapses an open video, and only that. The route reads the
+   * `data-video-open` attribute and leaves the camera alone while a video owns
+   * the key — one Escape should do one thing.
+   */
+  useEffect(() => {
+    if (!videoOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setVideoOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [videoOpen]);
+
+  /**
    * Build the player again from scratch.
    *
    * Reusing a player that errored is how the transport stays dead: a failed
@@ -763,6 +777,7 @@ export default function NowPlaying({
       data-volume={volume}
       data-needs-gesture={needsGesture ? "true" : "false"}
       data-player-state={failure ? "error" : usable ? "ready" : "loading"}
+      data-video-open={videoOpen ? "true" : undefined}
       className="surface overflow-hidden"
     >
       {/* Video expands on demand instead of permanently occupying a 16:9 box. */}

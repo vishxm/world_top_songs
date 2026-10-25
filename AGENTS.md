@@ -136,8 +136,9 @@ A click is not a drag. `CLICK_SLOP_PX = 10` and `CLICK_MAX_MS = 700`; movement
 inside that budget is still a click. On release, the up position is picked first
 and the down position is the fallback, so lifting off a pixel outside a small
 country still selects what was aimed at. A real drag or a long press never
-selects — it only re-picks hover after the camera settles. `onEmptyTap` (which
-folds the narrow sheet) is reached only by a genuine tap that missed.
+selects — it only re-picks hover after the camera settles. `onEmptyTap` is
+reached only by a genuine tap that missed; the route splits it by layout: narrow
+folds the sheet, wide returns to world view.
 
 Input during startup is queued, not dropped. The stage owns `pointerdown` from
 mount — before the canvas exists — so an early tap is seen. If the scene cannot
@@ -150,6 +151,36 @@ Re-picks are driven by the canvas pointer *and* by the controls' `change` event.
 Camera movement (inertia, zoom, auto-rotation, the flight to a selection) never
 moves the pointer, so a pointer-only listener leaves the header naming a country
 that has since slid away.
+
+### Focus and world view
+
+The camera has exactly two framings, in `app/lib/focus.ts`: one comfortable focus
+(globe radius ≈54% of the stage height, capped inside the free stage left of the
+rail) and one world view (whole globe, 92% of the free stage). The selected
+country's `span` is not an input — it belongs to picking. The old span formula
+clamped microstates to the *smallest* radius, which is the farthest camera, so
+Singapore flew outward; a fixed focus cannot do that.
+
+`resolveFocus(current, wanted, kind)` is the whole transition rule. `select` and
+`recentre` take `min(current, wanted)`: closer or stay, never farther. `world`
+and `layout` take `wanted` exactly. `GlobeView` reads `current` from the live
+camera (`pointOfView()`), not from route state, because a drag, a wheel zoom or a
+flight still in progress changes it without a render. The pure gate
+`npm run check:focus` sweeps 320–2560px widths and 0–800px sheets and fails if
+the clamp is removed; the browser gate proves the wiring on SG/HK/LU/SV.
+
+Escape returns to world view and keeps `?c=` and the ring. A dialog owns Escape
+instead: the picker closes, an open video collapses (`data-video-open` is the
+route's guard), and neither also resets the camera. A wide empty tap does the same
+as Escape; a narrow one still folds the sheet, because #14's tap contract takes
+precedence there and Escape remains the narrow world-view escape hatch.
+
+`worldView` is route state, not just a one-shot camera command: after Escape, a
+resize or a sheet re-frame must stay at the world altitude, so the layout branch
+reads `worldView` and emits `kind: 'world'`. Any selection clears it. Re-pressing
+the selected country changes no URL, so `select` bumps a recentre counter; the
+focus effect uses that counter as an input, otherwise the same-ISO click would be
+short-circuited and do nothing.
 
 ## Charts
 
