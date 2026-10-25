@@ -255,6 +255,16 @@ check:prefetch`, part of `check:globe`).
   hover. `GlobeView` reports `onMotionChange`; the route disables the prefetcher
   until the camera has been still for `MOTION_SETTLE_MS`.
 
+The 100ms budget is measured against the production build, by
+`scripts/latency-check.mjs` (`npm run check:latency`, the last step of
+`check:globe`). It builds the app, serves `build/` with `react-router-serve` on an
+ephemeral port, and runs the same two hovered clicks with the renderer paused.
+The dev gate keeps the functional assertions — one prefetch, no skeleton, no
+second request — but not the clock: `react-router dev` runs React's development
+build, and a CDP profile of one hovered click put 41.7% of samples in
+`recursivelyTraversePassiveUnmountEffects` and 15.5% in `jsxDEV`, which is why the
+same click measured 78–123ms there and ~25ms in production.
+
 `useChart` never aborts on a country change: the request is shared with the
 prefetcher and its payload is worth keeping, so a generation counter drops a late
 answer for the previous country instead. `app/lib/chartClient.ts` owns the single

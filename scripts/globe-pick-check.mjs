@@ -44,7 +44,9 @@
 //  22. corrupt browser storage is discarded and refetched without breaking
 //  23. hovering a charted country prefetches its chart, the click that follows
 //      renders with no loading state and no request, an uncharted country
-//      prefetches nothing, leaving aborts, and a drag never prefetches
+//      prefetches nothing, leaving aborts, and a drag never prefetches. The
+//      100ms budget itself is measured against the production build by
+//      `scripts/latency-check.mjs`; dev-mode React is not the product.
 //  24. on a phone the chart is a bottom sheet that folds to a peek bar, the peek
 //      answers for loading / charted / no-chart, every selection path unfolds
 //      it, an empty tap folds it, folding hands focus to the peek and reopening
@@ -2526,10 +2528,11 @@ check(
   brPixel ? `${prefetched.length} request(s): ${prefetched.join(", ") || "none"}` : "no BR pixel"
 );
 
-// -- 2. The click asks for nothing, flashes no skeleton, and lands inside the
-//       latency budget. `frameMs` is the software-rasterised frame time from
-//       above; the renderer is paused for the two timed clicks so this measures
-//       the app's commit rather than the rasteriser.
+// -- 2. The click asks for nothing and flashes no skeleton. The 100ms budget is
+//       measured by `scripts/latency-check.mjs` against the production build:
+//       this page runs `react-router dev`, whose double-render and `jsxDEV`
+//       calls are not what the product ships. `frameMs` is still reported so a
+//       regression in the app's own work stays visible in this gate.
 const rendererPaused = await pauseRenderer(true);
 // A software frame already in flight when `render` was stubbed can still take
 // `frameMs` to finish, and the click would queue behind it — that alone was the
@@ -2550,9 +2553,8 @@ await prefetchPage.waitForFunction(
 );
 const firstClick = await readClickProbe();
 check(
-  "clicking the hovered country shows its chart with no loading state, no request, in under 100ms",
+  "clicking the hovered country shows its chart with no loading state and no request",
   firstClick.rows !== null &&
-    firstClick.rows < 100 &&
     firstClick.skeleton === false &&
     prefetched.length === 1 &&
     rendererPaused,
@@ -2575,9 +2577,8 @@ await prefetchPage.waitForFunction(
 const secondClick = await readClickProbe();
 await pauseRenderer(false);
 check(
-  "a hovered click on a second country renders in under 100ms",
+  "a hovered click on a second country also needs no loading state and no request",
   secondClick.rows !== null &&
-    secondClick.rows < 100 &&
     secondClick.skeleton === false &&
     prefetched.length === 1,
   `${secondClick.rows}ms painted (${secondClick.commit}ms committed) at ${frameMs}ms/frame, skeleton ${secondClick.skeleton}, ${prefetched.length} request(s) including the prefetch`
