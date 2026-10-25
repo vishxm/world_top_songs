@@ -119,6 +119,62 @@
   }
 }
 
+/* ---------------------------------------------------------------------------
+   The sheet height.
+
+   `--sheet-h` is the one number the whole narrow layout is built from: the
+   chart sheet is exactly this tall, the region rail clears it, and `_index.tsx`
+   reads the *resolved* value back to offset the globe's camera and frame its
+   altitude. Nothing may hardcode a second sheet height.
+
+   It lives in CSS, not inline style, because the first paint is the server's
+   HTML: an inline value can only be measured after hydration, so a phone showed
+   a zero-height sheet and a bottom-pinned rail until JavaScript ran, then both
+   snapped into place. CSS knows the viewport before JavaScript does.
+
+   `48vh` is deliberate rather than `48dvh`: the fixed stage is sized by the
+   layout viewport, and a sheet that chases the mobile URL bar would re-frame the
+   globe while the user is reading. The reservation is the same with nothing
+   selected, which is what keeps first-visit framing stable before the bootstrap
+   picks a country.
+--------------------------------------------------------------------------- */
+@property --sheet-h {
+  syntax: "<length>";
+  inherits: true;
+  initial-value: 0px;
+}
+
+#main {
+  --sheet-h: 48vh;
+  /* One peek bar plus a little slack for another device's line-height. */
+  --sheet-peek: 56px;
+  /* The collapsed player, measured, and the aside's `gap-2.5` above it. */
+  --player-h: 84px;
+  --player-gap: 0.625rem;
+  --player-reserve: 0px;
+}
+
+/* Narrow only. On wide the panel is a right rail and nothing is reserved below
+   the globe, so the variable must stay 0 — the rail's own `lg:` offsets take
+   over. */
+@media (width >= 64rem) {
+  #main {
+    --sheet-h: 0px;
+  }
+}
+
+@media (width < 64rem) {
+  #main[data-sheet="folded"] {
+    /* Folding is not closing: the peek bar and any docked player still occupy
+       the bottom of the screen, so both are part of the reserve. */
+    --sheet-h: calc(var(--sheet-peek) + var(--player-reserve));
+  }
+
+  #main[data-player="true"] {
+    --player-reserve: calc(var(--player-h) + var(--player-gap));
+  }
+}
+
 @layer base {
   * {
     border-color: var(--color-line);

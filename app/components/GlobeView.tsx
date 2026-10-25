@@ -2,15 +2,26 @@ import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } fro
 import {
   BufferGeometry,
   Float32BufferAttribute,
+  type Group,
   LineBasicMaterial,
   LineSegments,
   MeshBasicMaterial,
   Object3D,
+  type Ray,
   Raycaster,
   Vector2,
 } from "three";
-import { firstUnoccluded, GLOBE_RADIUS, surfaceDistance } from "~/lib/pick";
+import {
+  CAP_BASE,
+  CAP_SELECTED,
+  GLOBE_RADIUS,
+  HIT_ALTITUDE,
+  PICK_EPSILON,
+  nearestUnoccluded,
+  surfaceDistance,
+} from "~/lib/pick";
 import type { Region } from "~/lib/countryMeta";
+import type { LandPart } from "~/lib/mapData";
 import type { GlobePalette } from "~/hooks/useGlobePalette";
 
 // react-globe.gl touches `window` at import time, so it must never load during
@@ -38,22 +49,17 @@ export interface StageCountry {
 // ---------------------------------------------------------------------------
 // Altitudes, in three-globe "globe radius" units.
 //
-// THE INVARIANT: never return 0. three-globe does not bake altitude into the
-// polygon geometry — it builds it at GLOBE_RADIUS and applies altitude as a
-// uniform mesh scale of `1 + alt`. So `alt = 0` puts the cap exactly coplanar
-// with the globe mesh, which (a) z-fights and (b) makes the raycast numerically
-// unstable, so hovering/clicking silently drops a large, random-looking share of
-// countries. three-globe's own default is 0.01 for this reason. The value here
-// must also stay above the border layer's radius so a cap is always the nearest
-// hit and the borders can never steal a hover.
+// `CAP_BASE`, `CAP_SELECTED`, `HIT_ALTITUDE` and `PICK_EPSILON` live in
+// `~/lib/pick`: the geometry gate asserts all of them are > 0, and the picking
+// rule and the rendered caps have to agree about the surface they describe.
 //
-// HOVER MUST NOT LIFT. Because altitude is a scale, raising it grows the cap
-// outward: a 2% lift adds several pixels of apparent size, so the hovered
-// country bleeds over its neighbours and captures the cursor from them. Hover is
-// signalled by colour alone; only the selection changes geometry.
+// THE INVARIANT, restated here because breaking it is silent: never 0. A cap at
+// altitude 0 is exactly coplanar with the globe mesh, so it z-fights and the
+// raycast becomes numerically unreliable, dropping a random-looking share of
+// countries from hover. HOVER MUST NOT LIFT either: altitude is a scale, so a
+// lift grows the cap over its neighbours and steals the cursor from them. Only
+// the selection changes geometry; hover is signalled by colour alone.
 // ---------------------------------------------------------------------------
-const CAP_BASE = 0.004;
-const CAP_SELECTED = 0.03;
 
 /**
  * The selection outline sits just outside the lifted cap, so the crisp edge
@@ -66,6 +72,12 @@ const CAP_SELECTED = 0.03;
  * a six-pixel country findable at all.
  */
 const OUTLINE_ALTITUDE = CAP_SELECTED + 0.0015;
+
+/** How long the camera must be quiet before the globe counts as at rest. A drag
+ *  ends with damping still gliding, and the pointer keeps a country under it the
+ *  whole way; without this, a drag looked exactly like a deliberate hover about
+ *  150ms after the release. */
+const MOTION_SETTLE_MS = 180;
 
 // The border layer sits just off the globe surface. Above the sphere itself
 // (never 0 — that is the coplanarity trap) and below every cap, so it is always
@@ -137,27 +149,25 @@ function ringsOf(geometry: unknown): Ring[] {
   return rings;
 }
 
-/** three-globe tags every object it generates; walk up to the nearest tag. */
-function globeTypeOf(obj: Object3D | null): string | null {
-  let o: (Object3D & { __globeObjType?: string }) | null = obj;
-  while (o) {
-    if (o.__globeObjType) return o.__globeObjType;
-    o = o.parent as (Object3D & { __globeObjType?: string }) | null;
-  }
-  return null;
-}
+/**
+ * A press that travels less than this is a click, not a drag.
+ *
+ * 4px — the old threshold — is below the tremor of a real tap: a mouse held on a
+ * six-pixel country drifts a pixel or two, and a finger on a phone drifts far
+ * more, so those presses were classified as drags and selected nothing. Ten is
+ * still small enough that a deliberate spin always crosses it within a frame or
+ * two of movement.
+ */
+const CLICK_SLOP_PX = 10;
 
-/** The `StageCountry` three-globe stored on a hit cap, if any. */
-function datumOf(obj: Object3D | null): StageCountry | null {
-  type Tagged = Object3D & { __data?: { data?: StageCountry } };
-  let o = obj as Tagged | null;
-  while (o) {
-    const datum = o.__data?.data;
-    if (datum?.iso) return datum;
-    o = o.parent as Tagged | null;
-  }
-  return null;
-}
+/**
+ * A press held longer than this is not a click, even if it never moved.
+ *
+ * A country can be tapped and released in well under a third of a second; a
+ * press that sits on the globe for the better part of a second is the user
+ * holding the camera still, not choosing the country under the cursor.
+ */
+const CLICK_MAX_MS = 700;
 
 /**
  * The occlusion rule itself lives in `~/lib/pick` — see there for why the planet
@@ -169,6 +179,14 @@ interface Props {
   countries: StageCountry[];
   /** Merged MultiLineString rings for the single-draw-call outline layer. */
   borders: [number, number][][];
+  /**
+   * Every land part, grouped by ISO — the source of the full-land hit layer.
+   *
+   * This is deliberately *not* derived from `countries[].geometry`: that geometry
+   * is the pruned cap layer, and the parts it drops (Hawaii, the Canaries, Jeju,
+   * the Galapagos) are exactly the ones this issue exists to make clickable.
+   */
+  landParts: readonly LandPart[];
   selectedIso: string | null;
   hoverIso: string | null;
   focus: { lat: number; lng: number; altitude: number; n: number } | null;
@@ -185,6 +203,10 @@ interface Props {
   palette: GlobePalette;
   onHover: (c: StageCountry | null) => void;
   onSelect: (c: StageCountry) => void;
+  /** Called with `true` while the camera is moving and `false` once it has been
+   *  still for a moment. Hover prefetch is suppressed in between: a drag glides
+   *  under the pointer long after the button is released. */
+  onMotionChange?: (moving: boolean) => void;
   /**
    * The scene is rendered, the caps have been built and picking is live. The
    * route uses this to hand its loading state over to the globe; it fires once.
@@ -204,6 +226,7 @@ interface Props {
 export default function GlobeView({
   countries,
   borders,
+  landParts,
   selectedIso,
   hoverIso,
   focus,
@@ -213,6 +236,7 @@ export default function GlobeView({
   palette,
   onHover,
   onSelect,
+  onMotionChange,
   onEmptyTap,
   onInteractive,
 }: Props) {
@@ -224,9 +248,19 @@ export default function GlobeView({
   const [dimensions, setDimensions] = useState({ w: 0, h: 0, dpr: 1 });
   const [mounted, setMounted] = useState(false);
   const [sceneReady, setSceneReady] = useState(false);
-  /** The scene exists *and* the country caps have been built, so a pick can
-   *  succeed. This is the point the loading state hands over. */
-  const [interactive, setInteractive] = useState(false);
+  /** three-globe has actually built the country caps, so hover repaints land. */
+  const [capsPainted, setCapsPainted] = useState(false);
+  /** The full-land hit layer exists, so a ray can resolve a country. */
+  const [hitReady, setHitReady] = useState(false);
+  /**
+   * The scene exists, the caps are painted *and* the hit layer is built. That is
+   * the honest readiness point: the renderer, the visuals and the picking
+   * surface all agree. The route hands its loading state over here, and a tap
+   * before this is queued rather than dropped on a half-built scene.
+   */
+  const interactive = capsPainted && hitReady;
+  const interactiveRef = useRef(interactive);
+  interactiveRef.current = interactive;
 
   // Hover bookkeeping lives in refs so a pointer storm never re-renders the route.
   const lastHoverIso = useRef<string | null>(null);
@@ -245,18 +279,55 @@ export default function GlobeView({
    *  route handed down a new closure. */
   const onEmptyTapRef = useRef(onEmptyTap);
   onEmptyTapRef.current = onEmptyTap;
-  /** Raycast plumbing, built once the canvas exists. */
+  /** Mirrors `onMotionChange` for the same reason: the controls listener is
+   *  registered once per scene, not per render. */
+  const onMotionChangeRef = useRef(onMotionChange);
+  onMotionChangeRef.current = onMotionChange;
+  /** Raycast plumbing, created once on mount — before the scene exists, because
+   *  a tap during startup still has to be queued rather than ignored. */
   const picker = useRef<{
-    el: HTMLCanvasElement;
-    scene: Object3D;
-    caps: Object3D[];
-    capsScannedAt: number;
+    /** The stage box, not the canvas: an early tap has no canvas to measure. */
+    el: HTMLDivElement;
     rc: Raycaster;
     ndc: Vector2;
   } | null>(null);
-  /** Last pointer position in client coords, or null when it left the canvas. */
+  /** Last pointer position in client coords, or null when it left the stage. */
   const pointer = useRef<{ x: number; y: number } | null>(null);
   const pickRaf = useRef(0);
+  /** The press currently in flight, if any. Lives outside the listener effect so
+   *  a re-render cannot lose a gesture halfway through. */
+  const gesture = useRef<{
+    pointerId: number;
+    x: number;
+    y: number;
+    at: number;
+    moved: boolean;
+    /** The world-space ray under the press, captured before the camera can move. */
+    ray: Ray | null;
+  } | null>(null);
+  /**
+   * The latest tap that arrived before the scene could answer it.
+   *
+   * Stored as a *world-space ray* when the camera existed at tap time, so it
+   * describes the surface the user actually saw rather than whatever the camera
+   * has flown to by the time the hit layer finishes. Before the camera exists
+   * there is nothing to convert, so the NDC is kept and resolved against the
+   * camera that eventually appears.
+   */
+  const queuedTap = useRef<{ ray: Ray | null; ndc: Vector2 | null } | null>(null);
+
+  /** ISO → country, so a hit mesh resolves without walking the scene graph. */
+  const countriesByIso = useMemo(() => {
+    const map = new Map<string, StageCountry>();
+    for (const c of countries) map.set(c.iso, c);
+    return map;
+  }, [countries]);
+  const countriesByIsoRef = useRef(countriesByIso);
+  countriesByIsoRef.current = countriesByIso;
+
+  /** The merged full-land meshes. Never added to the scene — see hitLayer.ts. */
+  const hitRef = useRef<Group | null>(null);
+  const hitApi = useRef<typeof import("~/lib/hitLayer") | null>(null);
 
   /**
    * Measure the stage box and never the window.
@@ -751,7 +822,7 @@ export default function GlobeView({
    */
   useEffect(() => {
     if (!sceneReady || countries.length === 0) {
-      setInteractive(false);
+      setCapsPainted(false);
       return;
     }
     let tries = 0;
@@ -759,7 +830,7 @@ export default function GlobeView({
     const paint = () => {
       tries += 1;
       if (applyHoverVisuals() > 0) {
-        setInteractive(true);
+        setCapsPainted(true);
         if (id) clearInterval(id);
       } else if (tries > 60) {
         if (id) clearInterval(id);
@@ -776,10 +847,10 @@ export default function GlobeView({
    * Hand the scene over exactly once.
    *
    * `interactive` is the honest point of readiness: the renderer exists, the
-   * country caps have actually been built, and a raycast can resolve a country.
-   * The route keeps its loading copy up until this fires, and the canvas stays
-   * `pointer-events-none` until then, so a tap during startup is never silently
-   * dropped on a half-built scene.
+   * country caps have actually been built, *and* the full-land hit layer is
+   * ready, so a raycast can resolve any drawn part of a country. The route keeps
+   * its loading copy up until this fires. A tap before it is queued by the
+   * stage's pointer handlers and replayed here, never silently dropped.
    */
   const reportedInteractive = useRef(false);
   useEffect(() => {
@@ -787,6 +858,69 @@ export default function GlobeView({
     reportedInteractive.current = true;
     onInteractive?.();
   }, [interactive, onInteractive]);
+
+  // -------------------------------------------------------------- hit layer
+  /**
+   * Build the full-land picking surface as soon as the land data arrives.
+   *
+   * The import is dynamic because three-conic-polygon-geometry reads
+   * `window.THREE` at module scope: a static import would run during SSR and
+   * crash the server render before the globe ever mounts.
+   *
+   * Building is synchronous once the module is in — ~1650 parts is a few hundred
+   * milliseconds — which is exactly why it happens behind the loading state and
+   * why `interactive` waits for it. It is the only thing that makes pruned
+   * islands reachable, so it must not be skipped.
+   */
+  useEffect(() => {
+    if (!sceneReady || landParts.length === 0) return;
+    let cancelled = false;
+    let layer: Group | null = null;
+    setHitReady(false);
+
+    const build = async () => {
+      const api = await import("~/lib/hitLayer");
+      if (cancelled) return;
+      hitApi.current = api;
+      layer = api.buildHitLayer(landParts, { radius: GLOBE_RADIUS, altitude: HIT_ALTITUDE });
+      if (cancelled) return;
+      if (layer.children.length === 0) {
+        console.error("country hit layer is empty — nothing would be clickable");
+      }
+      // Mirror `sizeOfHit` onto the meshes so a debug/gate raycast can apply the
+      // same enclave tie-break without reaching into React state.
+      for (const mesh of layer.children) {
+        const iso = mesh.userData.iso;
+        mesh.userData.span = countriesByIsoRef.current.get(iso)?.span ?? Infinity;
+      }
+      hitRef.current = layer;
+      // Debug hook, mirroring `__globe`. The browser gate raycasts these meshes
+      // as its oracle: a hit on the full-land layer is the only way to tell
+      // "ocean" from "a part the cap layer pruned", and it is what the gate must
+      // agree with.
+      (window as unknown as { __globeHit?: unknown }).__globeHit = layer;
+      setHitReady(true);
+    };
+
+    void build().catch((error: unknown) => {
+      if (cancelled) return;
+      // A failed chunk (or a tessellator that rejects every part) must not leave
+      // the loading state up forever. Log loudly and hand the scene over: the
+      // globe still renders, it just cannot resolve a country.
+      console.error("country hit layer failed to build", error);
+      setHitReady(true);
+    });
+
+    return () => {
+      cancelled = true;
+      if (!layer) return;
+      hitApi.current?.disposeHitLayer(layer);
+      if (hitRef.current === layer) {
+        hitRef.current = null;
+        (window as unknown as { __globeHit?: unknown }).__globeHit = null;
+      }
+    };
+  }, [sceneReady, landParts]);
 
   // Borders own the outline; three-globe's per-country strokes would cost a draw
   // call each and duplicate what the merged layer already draws crisply.
@@ -803,45 +937,75 @@ export default function GlobeView({
   // planet. That is not a theoretical concern: it reported Tanzania for pixels
   // over Brazil and Bolivia over Brazil, with no highlight drawn at all.
   //
-  // Owning the raycast lets the planet be the occluder it physically is: a cap
-  // counts only if it is in front of the globe's surface (surfaceDistance), and
-  // hits come back sorted near→far so the first surviving cap is the answer.
+  // We raycast the full-land hit layer, never the caps. The caps are pruned for
+  // the draw-call budget, so Hawaii, the Canaries, the Azores, Jeju and the
+  // Galapagos have no cap at all and were unreachable; the hit layer has one mesh
+  // per country covering every polygon part (see app/lib/hitLayer.ts). That makes
+  // "every drawn part is clickable" hold by construction.
   //
-  // Only the caps are raycast. The merged 120k-vertex border layer and the
-  // globe's own sphere are transparent to the pointer by design — including
-  // them cost 2ms per pick, versus 0.09ms here.
-  const pickAt = useCallback((clientX: number, clientY: number): StageCountry | null => {
+  // Owning the raycast lets the planet be the occluder it physically is: a hit
+  // counts only if it is in front of the globe's surface (surfaceDistance), and
+  // hits come back sorted near→far. That is what keeps a ray from resolving a
+  // country on the hidden hemisphere.
+  //
+  // Only the hit meshes are raycast. The merged 120k-vertex border layer and the
+  // globe's own sphere are transparent to the pointer by design — including them
+  // cost 2ms per pick, versus 0.09ms here.
+  const sizeOfHit = useCallback((hit: { object: Object3D }): number => {
+    const iso = hit.object.userData.iso;
+    if (typeof iso !== "string") return Infinity;
+    return countriesByIsoRef.current.get(iso)?.span ?? Infinity;
+  }, []);
+
+  /** Resolve an already-built world-space ray against the hit layer. */
+  const pickRay = useCallback(
+    (ray: Ray): StageCountry | null => {
+      const p = picker.current;
+      const layer = hitRef.current;
+      if (!p || !layer) return null;
+      p.rc.ray.copy(ray);
+      const hits = p.rc.intersectObjects(layer.children, false);
+      // The rule itself is in ~/lib/pick; this is only the plumbing that feeds
+      // it. `PICK_EPSILON` makes an enclave win over its host deterministically
+      // when both are equally near, instead of leaving it to triangle order.
+      const hit = nearestUnoccluded(hits, surfaceDistance(p.rc.ray), PICK_EPSILON, sizeOfHit);
+      if (!hit) return null;
+      const iso = hit.object.userData.iso;
+      return typeof iso === "string" ? (countriesByIsoRef.current.get(iso) ?? null) : null;
+    },
+    [sizeOfHit]
+  );
+
+  /** Build the world-space ray under a client point, without picking.
+   *
+   * A press captures this ray so the fallback target cannot drift with the
+   * camera: a 9px shaky click still nudges OrbitControls by ~half a degree, and
+   * re-picking the down *pixel* after that nudge can miss the small country the
+   * user actually pressed. */
+  const rayAt = useCallback((clientX: number, clientY: number): Ray | null => {
     const p = picker.current;
-    const g = globeRef.current;
-    if (!p || !g) return null;
+    const camera = globeRef.current?.camera?.();
+    if (!p || !camera) return null;
     const rect = p.el.getBoundingClientRect();
     if (rect.width === 0 || rect.height === 0) return null;
     if (clientX < rect.left || clientX > rect.right || clientY < rect.top || clientY > rect.bottom) {
       return null;
     }
-    // three-globe builds the caps asynchronously and re-digests them whenever
-    // the data changes, so the list is refreshed about once a second rather than
-    // assumed. A scene traverse is ~0.05ms; a stale list is a dead continent.
-    const now = Date.now();
-    if (now - p.capsScannedAt > 1000) {
-      p.capsScannedAt = now;
-      p.caps.length = 0;
-      p.scene.traverse((o) => {
-        if (globeTypeOf(o) === "polygon") p.caps.push(o);
-      });
-    }
-    if (p.caps.length === 0) return null;
-
     p.ndc.set(
       ((clientX - rect.left) / rect.width) * 2 - 1,
       -((clientY - rect.top) / rect.height) * 2 + 1
     );
-    p.rc.setFromCamera(p.ndc, g.camera());
-    // The rule itself is in ~/lib/pick; this is just the plumbing that feeds it.
-    const hit = firstUnoccluded(p.rc.intersectObjects(p.caps, true), surfaceDistance(p.rc.ray));
-    if (!hit) return null;
-    return datumOf(hit.object);
+    p.rc.setFromCamera(p.ndc, camera);
+    return p.rc.ray.clone();
   }, []);
+
+  const pickAt = useCallback(
+    (clientX: number, clientY: number): StageCountry | null => {
+      const ray = rayAt(clientX, clientY);
+      return ray ? pickRay(ray) : null;
+    },
+    [pickRay, rayAt]
+  );
 
   /** Push the picked country into React + the cap materials, coalesced to a
    *  frame. Returns true when the hover actually changed. */
@@ -861,103 +1025,258 @@ export default function GlobeView({
     [onHover, applyHoverVisuals]
   );
 
+  // The listener effect registers once, so every handler reaches the current
+  // closure through a ref. Without this a new `onSelect` (or a palette change)
+  // would tear down and rebuild the listeners mid-gesture.
+  const pickAtRef = useRef(pickAt);
+  pickAtRef.current = pickAt;
+  const rayAtRef = useRef(rayAt);
+  rayAtRef.current = rayAt;
+  const pickRayRef = useRef(pickRay);
+  pickRayRef.current = pickRay;
+  const commitHoverRef = useRef(commitHover);
+  commitHoverRef.current = commitHover;
+  const onSelectRef = useRef(onSelect);
+  onSelectRef.current = onSelect;
+
+  /** Run the pick on the next frame. Idempotent — many callers, one raycast. */
+  const schedulePick = useCallback(() => {
+    if (pickRaf.current) return;
+    pickRaf.current = requestAnimationFrame(() => {
+      pickRaf.current = 0;
+      const p = pointer.current;
+      if (!p) return;
+      commitHoverRef.current(pickAtRef.current(p.x, p.y));
+    });
+  }, []);
+
+  /**
+   * Keep a tap that arrived before the scene could answer it.
+   *
+   * The old handler attached to the canvas and the wrapper was
+   * `pointer-events-none` until `interactive`, so an early tap was not merely
+   * unanswered — it was never seen, and the click appeared to do nothing. The ray
+   * is computed now when the camera exists, so it describes the globe the user
+   * was actually looking at rather than wherever the camera has flown by replay.
+   */
+  const queueTap = useCallback((clientX: number, clientY: number) => {
+    const p = picker.current;
+    if (!p) return;
+    const rect = p.el.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return;
+    const ndc = new Vector2(
+      ((clientX - rect.left) / rect.width) * 2 - 1,
+      -((clientY - rect.top) / rect.height) * 2 + 1
+    );
+    const camera = globeRef.current?.camera?.();
+    if (camera) {
+      p.rc.setFromCamera(ndc, camera);
+      queuedTap.current = { ray: p.rc.ray.clone(), ndc: null };
+    } else {
+      queuedTap.current = { ray: null, ndc };
+    }
+  }, []);
+
+  // The stage owns the gesture from mount — before the canvas exists — so input
+  // during startup reaches us instead of falling through a pointer-events hole.
   useEffect(() => {
-    if (!sceneReady) return;
-    const g = globeRef.current;
-    const el = g?.renderer?.()?.domElement as HTMLCanvasElement | undefined;
-    if (!el) return;
-    picker.current = { el, scene: g.scene(), caps: [], capsScannedAt: 0, rc: new Raycaster(), ndc: new Vector2() };
-    // three-render-objects sets the canvas size in CSS pixels; `display: block`
-    // removes the inline-baseline strip that would otherwise show the stage
-    // through below the canvas.
-    el.style.display = "block";
+    const stage = stageRef.current;
+    if (!stage) return;
+    picker.current = { el: stage, rc: new Raycaster(), ndc: new Vector2() };
 
-    let downAt: { x: number; y: number } | null = null;
-    let dragged = false;
-
-    const onMove = (e: PointerEvent) => {
+    const onPointerDown = (e: PointerEvent) => {
+      // Right/middle mouse buttons are OrbitControls' pan/zoom, not a selection.
+      if (e.pointerType === "mouse" && e.button !== 0) return;
       takeOver();
-      if (downAt && Math.hypot(e.clientX - downAt.x, e.clientY - downAt.y) > 4) dragged = true;
+      gesture.current = {
+        pointerId: e.pointerId,
+        x: e.clientX,
+        y: e.clientY,
+        at: performance.now(),
+        moved: false,
+        ray: rayAtRef.current(e.clientX, e.clientY),
+      };
+    };
+
+    const onPointerMove = (e: PointerEvent) => {
+      takeOver();
+      const g = gesture.current;
+      if (g && g.pointerId === e.pointerId && !g.moved) {
+        if (Math.hypot(e.clientX - g.x, e.clientY - g.y) > CLICK_SLOP_PX) g.moved = true;
+      }
       pointer.current = { x: e.clientX, y: e.clientY };
-      if (dragged) {
+      if (g?.moved) {
         // A drag moves the country out from under the cursor, so any highlight
         // left on screen is already a lie.
-        commitHover(null);
+        commitHoverRef.current(null);
         return;
       }
       schedulePick();
     };
-    const onDown = (e: PointerEvent) => {
-      takeOver();
-      downAt = { x: e.clientX, y: e.clientY };
-      dragged = false;
-    };
-    const onUp = (e: PointerEvent) => {
-      downAt = null;
-      if (dragged) {
-        dragged = false;
-        // The `change` handler below re-picks through the damping glide.
+
+    const onPointerUp = (e: PointerEvent) => {
+      const g = gesture.current;
+      gesture.current = null;
+      if (!g || g.pointerId !== e.pointerId) {
         schedulePick();
         return;
       }
-      const c = pickAt(e.clientX, e.clientY);
-      if (c) onSelect(c);
+      const elapsed = performance.now() - g.at;
+      if (g.moved || elapsed > CLICK_MAX_MS) {
+        // A real drag (or a long press that was about the camera). The controls'
+        // `change` handler re-picks through the damping glide.
+        schedulePick();
+        return;
+      }
+
+      if (!interactiveRef.current) {
+        // No hit layer yet. Keep the tap until the scene can answer it.
+        queueTap(e.clientX, e.clientY);
+        return;
+      }
+
+      // A shaky click can lift off a pixel outside a small country. The ray
+      // captured at the press is the one the user aimed at — re-picking the down
+      // *pixel* would use the camera after a small orbit nudge and could miss.
+      let picked = pickAtRef.current(e.clientX, e.clientY);
+      if (!picked && (Math.abs(g.x - e.clientX) > 0.5 || Math.abs(g.y - e.clientY) > 0.5)) {
+        picked = g.ray ? pickRayRef.current(g.ray) : pickAtRef.current(g.x, g.y);
+      }
+      if (picked) onSelectRef.current(picked);
       // A tap that hit water or sky. Nothing was selected, so the pointer handler
       // has nothing else to do with it — which makes it the natural place to let
       // the route fold the sheet away. Only reached on a genuine tap, since the
       // drag case returned above.
       else onEmptyTapRef.current?.();
     };
-    const onLeave = () => {
-      pointer.current = null;
-      commitHover(null);
-    };
-    // Any camera movement re-resolves the hover. This is what keeps the readout
-    // honest through inertia, zoom, auto-rotation and the flight to a newly
-    // selected country — none of which move the pointer, so a pointer-only
-    // listener would leave it naming a country that has since slid away.
-    const onCameraChange = () => schedulePick();
 
-    el.addEventListener("pointermove", onMove);
-    el.addEventListener("pointerdown", onDown);
-    el.addEventListener("pointerup", onUp);
-    el.addEventListener("pointercancel", onLeave);
-    el.addEventListener("pointerleave", onLeave);
-    // OrbitControls emits `start` for a drag and for a wheel zoom, which covers
-    // both gestures that should end the idle rotation.
-    g.controls()?.addEventListener("start", takeOver);
-    g.controls()?.addEventListener("change", onCameraChange);
+    const onPointerLeave = () => {
+      pointer.current = null;
+      gesture.current = null;
+      commitHoverRef.current(null);
+    };
+
+    const onPointerCancel = () => {
+      pointer.current = null;
+      gesture.current = null;
+      commitHoverRef.current(null);
+    };
+
+    // A press that ends outside the stage never reaches `pointerup` here. Release
+    // the gesture so it cannot be mistaken for the next one, but do not select:
+    // the release position is outside the globe's box.
+    const onWindowUp = (e: PointerEvent) => {
+      if (gesture.current?.pointerId === e.pointerId) gesture.current = null;
+    };
+
+    stage.addEventListener("pointerdown", onPointerDown);
+    stage.addEventListener("pointermove", onPointerMove);
+    stage.addEventListener("pointerup", onPointerUp);
+    stage.addEventListener("pointerleave", onPointerLeave);
+    stage.addEventListener("pointercancel", onPointerCancel);
+    window.addEventListener("pointerup", onWindowUp);
+    window.addEventListener("pointercancel", onWindowUp);
     return () => {
-      el.removeEventListener("pointermove", onMove);
-      el.removeEventListener("pointerdown", onDown);
-      el.removeEventListener("pointerup", onUp);
-      el.removeEventListener("pointercancel", onLeave);
-      el.removeEventListener("pointerleave", onLeave);
-      g.controls()?.removeEventListener("start", takeOver);
-      g.controls()?.removeEventListener("change", onCameraChange);
+      stage.removeEventListener("pointerdown", onPointerDown);
+      stage.removeEventListener("pointermove", onPointerMove);
+      stage.removeEventListener("pointerup", onPointerUp);
+      stage.removeEventListener("pointerleave", onPointerLeave);
+      stage.removeEventListener("pointercancel", onPointerCancel);
+      window.removeEventListener("pointerup", onWindowUp);
+      window.removeEventListener("pointercancel", onWindowUp);
       picker.current = null;
+      gesture.current = null;
       if (pickRaf.current) cancelAnimationFrame(pickRaf.current);
     };
-  }, [sceneReady, commitHover, pickAt, onSelect, takeOver]);
+  }, [queueTap, schedulePick, takeOver]);
 
-  /** Run the pick on the next frame. Idempotent — many callers, one raycast. */
-  function schedulePick() {
-    if (pickRaf.current) return;
-    pickRaf.current = requestAnimationFrame(() => {
-      pickRaf.current = 0;
-      const p = pointer.current;
-      if (!p) return;
-      commitHover(pickAt(p.x, p.y));
-    });
-  }
+  /**
+   * Any camera movement re-resolves the hover.
+   *
+   * Inertia, zoom, auto-rotation and the flight to a newly selected country never
+   * move the pointer, so a pointer-only listener would leave the header naming a
+   * country that has since slid away.
+   */
+  useEffect(() => {
+    if (!sceneReady) return;
+    const controls = globeRef.current?.controls?.();
+    if (!controls) return;
+    // `start` covers a drag and a wheel zoom — both end the idle rotation. Idle
+    // rotation keeps emitting `change` as well, but it stops the moment the
+    // pointer takes over, so a resting hover never coexists with a spinning globe.
+    let moving = false;
+    let settle: ReturnType<typeof setTimeout> | undefined;
+    const reportMotion = () => {
+      if (!moving) {
+        moving = true;
+        onMotionChangeRef.current?.(true);
+      }
+      if (settle) clearTimeout(settle);
+      settle = setTimeout(() => {
+        settle = undefined;
+        if (!moving) return;
+        moving = false;
+        onMotionChangeRef.current?.(false);
+      }, MOTION_SETTLE_MS);
+    };
+    const onStart = () => {
+      takeOver();
+      reportMotion();
+    };
+    const onChange = () => {
+      schedulePick();
+      reportMotion();
+    };
+    controls.addEventListener("start", onStart);
+    controls.addEventListener("change", onChange);
+    return () => {
+      controls.removeEventListener("start", onStart);
+      controls.removeEventListener("change", onChange);
+      if (settle) clearTimeout(settle);
+      if (moving) onMotionChangeRef.current?.(false);
+    };
+  }, [sceneReady, schedulePick, takeOver]);
+
+  /** three-render-objects sizes the canvas in CSS pixels; `display: block`
+   *  removes the inline-baseline strip that would show the stage beneath it. */
+  useEffect(() => {
+    if (!sceneReady) return;
+    const canvas = globeRef.current?.renderer?.()?.domElement as HTMLCanvasElement | undefined;
+    if (canvas) canvas.style.display = "block";
+  }, [sceneReady]);
+
+  /**
+   * Replay the latest startup tap exactly once, when the scene can answer it.
+   *
+   * A tap on a country selects it; a tap that genuinely missed folds the sheet,
+   * same as it would have at the time. The queued gesture is the user's input,
+   * not a discarded one.
+   */
+  useEffect(() => {
+    if (!interactive) return;
+    const queued = queuedTap.current;
+    if (!queued) return;
+    queuedTap.current = null;
+    const p = picker.current;
+    const camera = globeRef.current?.camera?.();
+    if (!p) return;
+    let picked: StageCountry | null = null;
+    if (queued.ray) picked = pickRay(queued.ray);
+    else if (queued.ndc && camera) {
+      p.rc.setFromCamera(queued.ndc, camera);
+      picked = pickRay(p.rc.ray);
+    }
+    if (picked) onSelectRef.current(picked);
+    else onEmptyTapRef.current?.();
+  }, [interactive, pickRay]);
 
   return (
     <div ref={stageRef} className="absolute inset-0 overflow-hidden">
-      {/* The canvas is inert until caps exist — the route's loading copy stays
-          up until the matching `onInteractive`, so nothing a visitor does during
-          startup can land on a half-built scene and vanish. */}
+      {/* The stage, not the canvas, owns pointer input — so a tap that lands
+          before the canvas even exists is still seen and queued. The route's
+          loading copy stays up until the matching `onInteractive`. */}
       {mounted && dimensions.w > 0 ? (
-        <div className={`absolute inset-0 ${interactive ? "" : "pointer-events-none"}`}>
+        <div className="absolute inset-0">
           <Suspense fallback={null}>
             <Globe
               ref={globeRef}
@@ -978,9 +1297,9 @@ export default function GlobeView({
               polygonStrokeColor={noStroke}
               polygonLabel={getLabel}
               polygonsTransitionDuration={reducedMotion ? 0 : 200}
-              // We raycast the scene ourselves (see pickAt) — three-render-objects'
-              // filter cannot express "stop at the sphere", which is what keeps it
-              // from picking countries on the far side of the planet.
+              // We raycast the full-land hit layer ourselves (see pickRay) —
+              // three-render-objects' filter cannot express "stop at the sphere",
+              // which is what keeps it from picking countries on the far side.
               enablePointerInteraction={false}
               // Detail layer: every 50m border, one object, one draw call.
               customLayerData={borderData}

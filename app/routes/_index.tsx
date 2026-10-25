@@ -1,46 +1,45 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { useSearchParams } from "react-router";
 import GlobeView, { type StageCountry } from "~/components/GlobeView";
-import ChartPanel, { type ChartKind } from "~/components/ChartPanel";
+import ChartPanel from "~/components/ChartPanel";
 import ChartPeek from "~/components/ChartPeek";
-import type { ChartTrack } from "~/lib/analyticsCharts";
+import type { PickerRequest } from "~/components/CountryPicker";
+import type { ChartKind, ChartTrack } from "~/lib/chartTypes";
 import Header from "~/components/Header";
 import RegionRail from "~/components/RegionRail";
-import NowPlaying from "~/components/NowPlaying";
+import NowPlaying, { type PlayerHandle } from "~/components/NowPlaying";
 import { AtlasMark, EmptyState } from "~/components/ui";
 import { AlertTriangle } from "lucide-react";
 import { CHART_ISOS } from "~/lib/countries";
-import { loadBorderGeometry, loadCountryCaps } from "~/lib/mapData";
-import { useChart } from "~/hooks/useChart";
+import { loadCountryCaps, loadLandLayer, type LandLayer, type LandPart } from "~/lib/mapData";
+import { useChart, useChartPrefetch } from "~/hooks/useChart";
 import { useReducedMotion, useStoredState } from "~/hooks/usePrefs";
 import { useGlobePalette } from "~/hooks/useGlobePalette";
 import type { Region } from "~/lib/countryMeta";
+import { countryName, countryRegion, isKnownCountry } from "~/lib/countryMeta";
 
 const PANEL_WIDTH = 384;
 const GUTTER = 48;
-/** Viewport fraction the bottom sheet occupies on narrow screens when it is
- *  open. This is the source of the sheet's own height (`--sheet-h`), and the globe
- *  offset, camera altitude and chrome offsets are all derived from the same
- *  number — see `sheetReserve`. */
-const SHEET_FRACTION = 0.48;
-/** Collapsed sheet: one peek bar (measured at 54px) plus a couple of px of slack,
- *  so a slightly taller bar on another device cannot slide under the globe. */
-const SHEET_PEEK_PX = 56;
-/**
- * Height the docked player adds under a folded sheet: its collapsed controls
- * (measured at 84px) plus the `gap-2.5` above them.
- *
- * A constant rather than a measurement, because the obvious way to measure it —
- * a ResizeObserver feeding layout that feeds the globe — is a loop waiting to
- * happen for a few pixels. It also only needs to be right for the collapsed
- * player: opening the video makes it ~200px taller, and at that size it covers
- * the globe anyway.
- */
-const PLAYER_ALLOWANCE_PX = 94;
+/** The one layout breakpoint: the chart is a bottom sheet below it and a right
+ *  rail at or above it. It matches Tailwind's `lg` and the CSS that owns
+ *  `--sheet-h` — a second threshold here is how the tablet layout ended up with
+ *  a full-height rail positioned by a phone's sheet reserve. */
+const WIDE_MIN_PX = 1024;
 /** Vertical space the header occupies on narrow screens; the globe centres in
  *  what is left. Matches Header.tsx's two-row mobile layout. */
 const HEADER_CLEARANCE = 118;
 const FOV_TAN = Math.tan((50 / 2) * (Math.PI / 180)); // three-globe's fixed 50° fov
+
+/**
+ * Stable empty layers for the window between mount and the map arriving.
+ *
+ * Module-level rather than inline `[]` defaults: GlobeView keys its full-land hit
+ * layer off the parts array's identity, and a fresh array on every route render
+ * (the route re-renders on every globe hover) would dispose and rebuild ~1650
+ * conic polygons on every pointer move.
+ */
+const EMPTY_BORDERS: [number, number][][] = [];
+const EMPTY_PARTS: LandPart[] = [];
 
 type RecoveryNotice = { message: string; iso: string };
 
@@ -64,12 +63,19 @@ function altitudeForRadius(viewportH: number, targetRadius: number): number {
  * the selected country is found by spinning rather than by framing.
  *
  * `sheetPx` is the sheet's height in px, not a fraction: it changes when the
- * sheet is collapsed, and the globe has to grow into whatever is left. Deriving
- * it from a constant is what pinned the phone globe to a 48vh sliver even after
- * the sheet dropped away.
+ * sheet is collapsed, and the globe has to grow into whatever is left. It is
+ * read from `--sheet-h`, the same variable that sizes the sheet and lifts the
+ * rail, so the camera cannot disagree with the layout about how much room it has.
  */
-function altitudeForViewport(span: number, width: number, viewportH: number, sheetPx: number): number {
-  if (width < 1024) {
+function altitudeForViewport(
+  span: number,
+  isWide: boolean,
+  width: number,
+  viewportH: number,
+  sheetPx: number
+): number {
+  if (width <= 0 || viewportH <= 0) return 2.5;
+  if (!isWide) {
     // Fit the clear band above the sheet, not the whole screen: the globe should
     // read as a full disc in the space the user can actually see.
     const clearBand = viewportH - sheetPx - HEADER_CLEARANCE;
@@ -92,31 +98,54 @@ export default function Home() {
   const [params, setParams] = useSearchParams();
   const reducedMotion = useReducedMotion();
   const palette = useGlobePalette();
-  const [storedIso, setStoredIso] = useStoredState("wts.country", "US");
+  const [storedIso, setStoredIso, storedHydrated] = useStoredState("wts.country", "US");
 
-  // Measure once per layout change rather than tracking every scroll/resize:
-  // the only numbers we need are the breakpoint, a coarse viewport width, and
-  // the height (the narrow-screen globe offset depends on it).
-  const viewportRef = useRef({ w: 1440, h: 900, isWide: true });
+  // The layout is measured before the first client paint (a layout effect), and
+  // starts mobile-first so the hydrated markup matches the server's. Nothing in
+  // the *visual* layout depends on this state — CSS owns the responsive layout
+  // and `--sheet-h` — so a wide layout is already correct in the server HTML and
+  // does not wait for this. The state exists for behaviour (fold availability)
+  // and for the camera, which has not painted a frame yet.
+  const [viewport, setViewport] = useState({ w: 0, h: 0, isWide: false });
+  /** Resolved height of `--sheet-h`, read from the DOM rather than recomputed.
+   *  See the hook below: one number, one owner. */
+  const [sheetReserve, setSheetReserve] = useState(0);
+  const mainRef = useRef<HTMLElement | null>(null);
 
   const [countries, setCountries] = useState<StageCountry[]>([]);
-  const [borders, setBorders] = useState<[number, number][][]>([]);
+  const [land, setLand] = useState<LandLayer | null>(null);
   const [mapError, setMapError] = useState<string | null>(null);
   const [mapLoading, setMapLoading] = useState(true);
   /** Set by GlobeView once the caps exist and picking is live. Until then the
    *  stage shows its loading copy and the canvas ignores pointer input. */
   const [globeReady, setGlobeReady] = useState(false);
   const handleGlobeInteractive = useCallback(() => setGlobeReady(true), []);
+  /** True while the camera is moving (drag, zoom, a flight to a selection) and
+   *  for a moment after it stops. Hover prefetch is suppressed in between: a
+   *  drag keeps gliding under the pointer, which otherwise looked like a hover. */
+  const [globeMoving, setGlobeMoving] = useState(false);
+  const handleGlobeMotion = useCallback((moving: boolean) => setGlobeMoving(moving), []);
 
   const [hovered, setHovered] = useState<StageCountry | null>(null);
   const [regionFilter, setRegionFilter] = useState<Region | null>(null);
   const [focus, setFocus] = useState<{ lat: number; lng: number; altitude: number; n: number } | null>(null);
   const [activeIndex, setActiveIndex] = useState<number | null>(null);
-  const [viewportW, setViewportW] = useState(1440);
+  /** The player's transport, so pressing the row that is already playing is a
+   *  pause/resume instead of a dead click (or a restart from zero). */
+  const playerHandle = useRef<PlayerHandle | null>(null);
+  const playerBoxRef = useRef<HTMLDivElement | null>(null);
+  /** The player's natural height, measured. `--player-h` is a fallback, not a
+   *  second source of truth: opening the video or showing the autoplay notice
+   *  makes the card taller, and the folded sheet and the rail have to clear it. */
+  const [playerHeight, setPlayerHeight] = useState(0);
   /** Set when a bad `?c=` was recovered to a real country, so the chart can
    *  explain why the address changed. Tied to the fallback ISO so it cannot
    *  outlive a later back/forward to another country. */
   const [recoveryNotice, setRecoveryNotice] = useState<RecoveryNotice | null>(null);
+  /** A one-shot request for the country picker, used by the no-chart notice.
+   *  `id` increments per request so pressing the action again after closing the
+   *  dialog reopens it; a stable object would be treated as already handled. */
+  const [pickerRequest, setPickerRequest] = useState<PickerRequest | null>(null);
 
   /**
    * Narrow layouts only: has the user folded the chart sheet away to the peek bar?
@@ -133,10 +162,10 @@ export default function Home() {
   useEffect(() => {
     const ctrl = new AbortController();
     setMapLoading(true);
-    Promise.all([loadCountryCaps(ctrl.signal), loadBorderGeometry(ctrl.signal)])
-      .then(([caps, rings]) => {
+    Promise.all([loadCountryCaps(ctrl.signal), loadLandLayer(ctrl.signal)])
+      .then(([caps, layer]) => {
         setCountries(caps);
-        setBorders(rings);
+        setLand(layer);
         setMapError(null);
       })
       .catch((e: unknown) => {
@@ -149,32 +178,36 @@ export default function Home() {
     return () => ctrl.abort();
   }, []);
 
-  // Only the breakpoint and the width matter, so snap the width to 100px steps
-  // and ignore height-only changes (mobile browser chrome) entirely.
-  useEffect(() => {
-    let lastW = -1;
-    let lastH = -1;
-    const update = () => {
-      const w = Math.round(window.innerWidth / 100) * 100;
+  // Measure the viewport before paint. `sheetReserve` is read from the resolved
+  // `--sheet-h` custom property (registered as `<length>`, so the computed value
+  // is px, not the `48vh` token) after every input that can change it: the
+  // breakpoint, the fold state and the player. It is the one number the camera
+  // offset and altitude are derived from, and it is the same variable that sizes
+  // the sheet and lifts the rail.
+  //
+  // Reading instead of recomputing is the point: `48vh` is resolved by CSS against
+  // the viewport the browser actually laid out, while `window.innerHeight` can be
+  // a different viewport on a phone with its URL bar showing. Two numbers for the
+  // same sheet is what made the rail and the globe disagree.
+  useLayoutEffect(() => {
+    const read = () => {
+      const w = window.innerWidth;
       const h = window.innerHeight;
-      const isWide = window.innerWidth >= 1024;
-      // Height only matters on narrow layouts (mobile browser chrome changes it).
-      const hBucket = isWide ? 0 : Math.round(h / 40) * 40;
-      if (w === lastW && hBucket === lastH) return;
-      lastW = w;
-      lastH = hBucket;
-      setViewportW(w);
-      viewportRef.current = { w, h: hBucket || h, isWide };
+      const isWide = w >= WIDE_MIN_PX;
+      setViewport((prev) =>
+        prev.w === w && prev.h === h && prev.isWide === isWide ? prev : { w, h, isWide }
+      );
     };
-    update();
-    window.addEventListener("resize", update);
-    return () => window.removeEventListener("resize", update);
+    read();
+    window.addEventListener("resize", read);
+    return () => window.removeEventListener("resize", read);
   }, []);
 
   // ---------------------------------------------------------------- routing
   // The URL is the source of truth for selection, so a country is shareable and
   // the back button steps through history. Codes are case-insensitive on the way
-  // in; the URL is canonicalised to the map's ISO once the map has loaded.
+  // in; the URL is canonicalised to the ISO as soon as it is known, without
+  // waiting for the map.
   const rawIso = params.get("c");
   const requestedIso = rawIso?.trim() ? rawIso.trim().toUpperCase() : null;
   const kind: ChartKind = params.get("kind") === "videos" ? "videos" : "songs";
@@ -185,8 +218,23 @@ export default function Home() {
     return m;
   }, [countries]);
 
-  const selected = requestedIso ? byIso.get(requestedIso) ?? null : null;
-  const selectedIso = selected?.iso ?? null;
+  // Selection is validated against the generated country metadata, which is the
+  // same set the caps layer is built from. That makes the selection — and with
+  // it the chart request — available on the first render, in parallel with the
+  // map assets, instead of waiting behind their fetch and parse.
+  //
+  // `selected` is the map-backed record and stays null until the caps arrive; it
+  // carries the anchor and span the camera needs. Everything the panel shows
+  // (name, region) is static metadata.
+  const selectedIso = isKnownCountry(requestedIso) ? requestedIso : null;
+  const selected = selectedIso ? byIso.get(selectedIso) ?? null : null;
+  const selectedMeta = selectedIso
+    ? {
+        iso: selectedIso,
+        name: countryName(selectedIso) ?? selectedIso,
+        region: countryRegion(selectedIso) ?? ("Polar & Remote" as Region),
+      }
+    : null;
   const recoveryMessage = recoveryNotice?.iso === selectedIso ? recoveryNotice.message : null;
 
   const patchParams = useCallback(
@@ -224,6 +272,12 @@ export default function Home() {
 
   const changeTab = useCallback((k: ChartKind) => patchParams({ kind: k }), [patchParams]);
 
+  /** An uncharted country's only way forward: open the picker already filtered
+   *  to countries that have a chart to show. */
+  const findCharted = useCallback(() => {
+    setPickerRequest((prev) => ({ id: (prev?.id ?? 0) + 1, chartedOnly: true }));
+  }, []);
+
   const closePanel = useCallback(() => {
     setRecoveryNotice(null);
     patchParams({ c: null });
@@ -233,30 +287,34 @@ export default function Home() {
   // empty stage. `replace` keeps this out of the history stack. A supplied
   // `?c=` — even a blank one — goes through the recovery effects below instead,
   // so a malformed link is explained rather than silently bootstrapped.
+  //
+  // The choice is made from static metadata as soon as the stored preference has
+  // hydrated, not from the map. Waiting for the caps layer was what serialised
+  // the first chart request behind two GeoJSON downloads.
   const bootstrapped = useRef(false);
   useEffect(() => {
-    if (bootstrapped.current || countries.length === 0) return;
+    if (bootstrapped.current || !storedHydrated) return;
     bootstrapped.current = true;
     if (rawIso !== null) return;
-    const iso = byIso.has(storedIso) ? storedIso : (CHART_ISOS.find((i) => byIso.has(i)) ?? "US");
+    const iso = isKnownCountry(storedIso) ? storedIso : (CHART_ISOS.find(isKnownCountry) ?? "US");
     setParams(new URLSearchParams({ c: iso, kind }), { replace: true });
-  }, [countries.length, byIso, storedIso, rawIso, setParams, kind]);
+  }, [storedHydrated, storedIso, rawIso, setParams, kind]);
 
   // A known country written in lower case (or with stray spaces) is still the
   // same selection. Rewrite the address bar to the canonical ISO with replace,
   // so the sloppy spelling does not become a history entry.
   useEffect(() => {
-    if (!selected) return;
-    if (rawIso === selected.iso) return;
-    patchParams({ c: selected.iso }, { replace: true });
-  }, [selected, rawIso, patchParams]);
+    if (!selectedIso) return;
+    if (rawIso === selectedIso) return;
+    patchParams({ c: selectedIso }, { replace: true });
+  }, [selectedIso, rawIso, patchParams]);
 
   // A bad `?c=` must not leave a bare globe. Once the map is available, fall
   // back to the last valid country (or the first charted one), stay on the same
   // history entry, and tell the chart why the address changed. A blank `?c=`
   // is a bad link too; no `c` at all is an intentional empty stage.
   useEffect(() => {
-    if (mapLoading || countries.length === 0 || selected) return;
+    if (mapLoading || countries.length === 0 || selectedIso) return;
     if (rawIso === null) return;
     const iso = byIso.has(storedIso) ? storedIso : (CHART_ISOS.find((i) => byIso.has(i)) ?? null);
     const fallback = iso ? (byIso.get(iso) ?? null) : null;
@@ -276,7 +334,7 @@ export default function Home() {
     countries.length,
     rawIso,
     requestedIso,
-    selected,
+    selectedIso,
     byIso,
     storedIso,
     patchParams,
@@ -287,10 +345,27 @@ export default function Home() {
   // The queue is a snapshot of whatever list the user pressed play in. It
   // survives country and tab changes so audio is never interrupted by navigation.
   const [queue, setQueue] = useState<ChartTrack[]>([]);
+  /** Video ids that the player has already refused in this queue. Reset when a
+   *  new queue is taken, so a broken track is tried again on a deliberate play. */
+  const failedTracksRef = useRef<Set<string>>(new Set());
+  /** Set only when every entry in the snapshot has failed. The player then stops
+   *  on the current track and explains why instead of walking the queue forever. */
+  const [queueError, setQueueError] = useState<string | null>(null);
+  const queueRef = useRef(queue);
+  queueRef.current = queue;
+  const activeIndexRef = useRef(activeIndex);
+  activeIndexRef.current = activeIndex;
 
-  const { data, loading, error, retry } = useChart(selectedIso, kind);
+  const { data, loading, error, retry } = useChart(selectedIso);
+  // A deliberate hover is the cheapest signal that a click is coming. The
+  // prefetch lands in the same cache `useChart` reads, so the click is a render
+  // rather than a request — and it only ever fires for charted countries, after
+  // the pointer has rested on one.
+  useChartPrefetch(hovered?.iso ?? null, !globeMoving);
 
   const playFromChart = useCallback((tracks: ChartTrack[], index: number) => {
+    failedTracksRef.current = new Set();
+    setQueueError(null);
     setQueue(tracks);
     setActiveIndex(index);
   }, []);
@@ -305,6 +380,71 @@ export default function Home() {
     setActiveIndex((i) => (i == null || queue.length === 0 ? i : (i + 1) % queue.length));
   }, [queue.length]);
 
+  /**
+   * A track the player could not start.
+   *
+   * Skipping forward is what makes one broken video harmless, but skipping is
+   * only safe while there is something untried left: wrapping around a queue
+   * whose every entry fails is the infinite `load → error → load` loop this
+   * replaces. The failed ids are remembered per queue, so a later error does not
+   * restart at the track we already know is broken.
+   */
+  const handleTrackError = useCallback((videoId: string) => {
+    failedTracksRef.current.add(videoId);
+    const list = queueRef.current;
+    const current = activeIndexRef.current ?? 0;
+    for (let offset = 1; offset <= list.length; offset += 1) {
+      const next = (current + offset) % list.length;
+      if (!failedTracksRef.current.has(list[next].videoId)) {
+        setQueueError(null);
+        setActiveIndex(next);
+        return;
+      }
+    }
+    setQueueError(
+      "Every track in this queue was unavailable. Try again, or play a different chart."
+    );
+  }, []);
+
+  const retryQueue = useCallback(() => {
+    failedTracksRef.current = new Set();
+    setQueueError(null);
+    // The current id did not change, so rebuilding has to be explicit.
+    playerHandle.current?.retry();
+  }, []);
+
+  /** A track that actually plays clears the queue failure: the banner describes
+   *  a queue where nothing worked, and it must not outlive that condition. */
+  const handlePlayingChange = useCallback((playing: boolean) => {
+    setIsPlaying(playing);
+    if (playing) setQueueError(null);
+  }, []);
+
+  /** Stable for the panel's memo: the route re-renders on every globe hover, and
+   *  an inline handler here would re-render all 20 rows on each pointer move.
+   *  The queue snapshots the active tab's list at the moment play was pressed. */
+  const playFromChartAt = useCallback(
+    (index: number) => {
+      const list = data && data.charted ? data[kind] : null;
+      const track = list?.[index];
+      if (!list || !track) return;
+      // The row that is already loaded is a transport toggle, not a new queue.
+      // Restarting the video from zero because the user asked to resume would
+      // be wrong. Compare video ids, not indexes: the queue is a snapshot from
+      // whichever list play was pressed in, so positions do not correspond.
+      if (track.videoId === activeVideoId) {
+        // While the queue has failed there is nothing to toggle: the player is
+        // dead until it is rebuilt, so the active row retries instead of being
+        // a "Resume" that silently does nothing.
+        if (queueError) retryQueue();
+        else playerHandle.current?.toggle();
+        return;
+      }
+      playFromChart(list, index);
+    },
+    [activeVideoId, data, kind, playFromChart, queueError, retryQueue]
+  );
+
   // Guard against a queue that shrank under us (e.g. a stale track list).
   useEffect(() => {
     if (activeIndex != null && queue.length > 0 && activeIndex >= queue.length) {
@@ -318,23 +458,60 @@ export default function Home() {
   // Narrow: the panel is a bottom sheet, so shift up by half its height — the
   // globe then reads in the clear band above it.
   //
-  // `sheetReserve` is that height in px and it is the single number the offset,
-  // the camera altitude and the sheet's own CSS height are all derived from. It
-  // has to be px rather than a constant fraction because the sheet folds: a
-  // fraction cannot express "56px peek bar, or 48vh of list".
-  const isWide = viewportRef.current.isWide;
-  const sheetOpen = !!selected && !sheetFolded;
-  const sheetReserve = isWide
-    ? 0
-    : selected && !sheetOpen
-      ? // Folded: the peek bar, plus whatever the player adds beneath it.
-        SHEET_PEEK_PX + (playerActive ? PLAYER_ALLOWANCE_PX : 0)
-      : // Open, or nothing selected at all. The no-selection case deliberately
-        // keeps reserving the full sheet: there is no sheet on screen then, but
-        // the globe is framed against that reservation, and collapsing it to a
-        // peek bar's worth would silently move it on a first visit before the
-        // bootstrap picks a country.
-        viewportRef.current.h * SHEET_FRACTION;
+  // `sheetReserve` is the resolved height of `--sheet-h` (see app.css and the
+  // measurement above). The sheet's CSS size, the rail's lift, this offset and
+  // the camera altitude all read that one number; nothing here recomputes it.
+  const isWide = viewport.isWide;
+  // On a wide layout the panel is a rail and a stale fold state must not turn it
+  // into a peek bar after a resize.
+  const sheetOpen = !!selectedMeta && (isWide || !sheetFolded);
+  const docked = !!selectedMeta || playerActive;
+  const railBottom = selectedMeta
+    ? // Above the sheet (open) or the peek/player stack (folded). `--sheet-h`
+      // already includes the player in both cases.
+      "bottom-[calc(var(--sheet-h)+1.25rem)] lg:bottom-gutter"
+    : playerActive
+      ? // No sheet, but the player is still docked: clear its measured height,
+        // the aside's `bottom-3` inset and a little air.
+        "bottom-[calc(var(--player-h)+0.75rem+1rem)] lg:bottom-gutter"
+      : "bottom-3 lg:bottom-gutter";
+
+  useLayoutEffect(() => {
+    const el = mainRef.current;
+    if (!el) return;
+    const read = () => {
+      const px = Number.parseFloat(getComputedStyle(el).getPropertyValue("--sheet-h")) || 0;
+      setSheetReserve((prev) => (Math.abs(prev - px) < 0.5 ? prev : px));
+    };
+    read();
+    // A viewport change resizes the fixed stage even when no React state changes,
+    // and the breakpoint changes the variable without one. The dependencies cover
+    // the changes that do not resize the stage (selection, fold, player) — and
+    // `playerHeight`, because a measured player changes the folded reserve
+    // without changing the stage box the observer watches.
+    const observer = new ResizeObserver(read);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [viewport.isWide, selectedIso, sheetFolded, playerActive, playerHeight]);
+
+  /**
+   * Measure the player, rather than trusting the `84px` fallback in app.css.
+   * Opening the video or showing the autoplay notice makes the card taller, and
+   * both `--sheet-h` (folded) and the rail's clearance are derived from it. The
+   * observer is what keeps those in step when the card grows after a click.
+   */
+  useLayoutEffect(() => {
+    const el = playerBoxRef.current;
+    if (!el) return;
+    const read = () => {
+      const px = Math.ceil(el.getBoundingClientRect().height);
+      setPlayerHeight((prev) => (prev === px ? prev : px));
+    };
+    read();
+    const observer = new ResizeObserver(read);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [playerActive]);
 
   // Memoised so its identity survives a re-render. The route re-renders on every
   // globe hover, and GlobeView keys its offset effect off this prop: a fresh array
@@ -356,21 +533,16 @@ export default function Home() {
   const focusedKey = useRef<string | null>(null);
   useEffect(() => {
     if (!selected) return;
-    const key = `${selected.iso}@${Math.round(sheetReserve)}`;
+    const key = `${selected.iso}@${Math.round(sheetReserve)}@${isWide ? "w" : "n"}`;
     if (focusedKey.current === key) return;
     focusedKey.current = key;
     setFocus({
       lat: selected.lat,
       lng: selected.lng,
-      altitude: altitudeForViewport(
-        selected.span,
-        viewportRef.current.w,
-        viewportRef.current.h,
-        sheetReserve
-      ),
+      altitude: altitudeForViewport(selected.span, isWide, viewport.w, viewport.h, sheetReserve),
       n: Date.now(),
     });
-  }, [selected, viewportW, sheetReserve]);
+  }, [selected, viewport.w, viewport.h, isWide, sheetReserve]);
 
   useEffect(() => {
     if (!selectedIso) focusedKey.current = null;
@@ -385,17 +557,53 @@ export default function Home() {
   }, [byIso, select]);
 
   /** Fold/unfold the sheet. Narrow layouts only — on wide the panel is a rail
-   *  with no fold, so `isWide` short-circuits and the state just sits unused. */
+   *  with no fold, so `isWide` short-circuits and the state just sits unused.
+   *  Returns whether the state actually changed, so a caller only claims focus
+   *  when a control is genuinely about to unmount. */
   const setFolded = useCallback(
     (folded: boolean) => {
-      if (viewportRef.current.isWide) return;
+      if (isWide) return false;
       setSheetFolded(folded);
+      return true;
     },
-    []
+    [isWide]
   );
 
-  const foldSheet = useCallback(() => setFolded(true), [setFolded]);
-  const unfoldSheet = useCallback(() => setFolded(false), [setFolded]);
+  /**
+   * The chevron and the peek bar each unmount on the state change they ask for,
+   * so focus would otherwise fall to `<body>` and a keyboard user would have to
+   * tab back to the panel they were just using. This records where focus should
+   * go, and the effect below hands it over after the commit that mounts it.
+   *
+   * Only those two controls set it: a tap on the globe that folds, or a
+   * selection that unfolds, leaves focus where the user put it — moving it off
+   * the canvas would be a surprise, and neither path needs the affordance.
+   */
+  const focusAfterFold = useRef<"peek" | "panel" | null>(null);
+  const peekRef = useRef<HTMLButtonElement>(null);
+  const foldRef = useRef<HTMLButtonElement>(null);
+
+  const foldSheet = useCallback(() => {
+    if (setFolded(true)) focusAfterFold.current = "peek";
+  }, [setFolded]);
+
+  const unfoldSheet = useCallback(() => {
+    if (setFolded(false)) focusAfterFold.current = "panel";
+  }, [setFolded]);
+
+  /** A tap that missed on the stage folds the sheet, but is not a keyboard
+   *  interaction — no focus handover. */
+  const foldFromStage = useCallback(() => {
+    setFolded(true);
+  }, [setFolded]);
+
+  useEffect(() => {
+    const target = focusAfterFold.current;
+    if (!target) return;
+    focusAfterFold.current = null;
+    if (target === "peek") peekRef.current?.focus();
+    else foldRef.current?.focus();
+  }, [sheetFolded]);
 
   if (mapError) {
     return (
@@ -419,22 +627,30 @@ export default function Home() {
   }
 
   return (
-    // `--sheet-h` is how the chrome above the sheet (the region rail) learns how
-    // tall the sheet currently is. It has to be a variable rather than the `48vh`
-    // literal that used to be repeated in those offsets: once the sheet can fold
-    // to a 56px peek bar, a hardcoded fraction is simply the wrong number, and
-    // Tailwind cannot compute one class from another class.
+    // `--sheet-h` is defined in app.css, so the server-rendered first paint
+    // already knows how tall the sheet is. `data-sheet` and `data-player` are the
+    // only inputs JS contributes; everything that draws reads the one variable.
     <main
       id="main"
+      ref={mainRef}
       className="fixed inset-0 overflow-hidden bg-void text-ink"
-      style={{ "--sheet-h": `${sheetReserve}px` } as CSSProperties}
+      // The measured player height wins over the stylesheet fallback. It is
+      // only written once a player exists, so the first paint is unchanged.
+      style={
+        playerHeight > 0
+          ? ({ "--player-h": `${playerHeight}px` } as CSSProperties)
+          : undefined
+      }
+      data-sheet={selectedMeta ? (isWide || !sheetFolded ? "open" : "folded") : undefined}
+      data-player={playerActive ? "true" : undefined}
     >
       {/* Globe stage. A named landmark so the canvas is not an anonymous
           full-bleed div in the accessibility tree. */}
       <section aria-label="World globe" className="absolute inset-0 z-0">
         <GlobeView
           countries={countries}
-          borders={borders}
+          borders={land?.rings ?? EMPTY_BORDERS}
+          landParts={land?.parts ?? EMPTY_PARTS}
           selectedIso={selectedIso}
           hoverIso={hovered?.iso ?? null}
           focus={focus}
@@ -444,7 +660,8 @@ export default function Home() {
           palette={palette}
           onHover={setHovered}
           onSelect={select}
-          onEmptyTap={foldSheet}
+          onMotionChange={handleGlobeMotion}
+          onEmptyTap={isWide ? undefined : foldFromStage}
           onInteractive={handleGlobeInteractive}
         />
       </section>
@@ -461,6 +678,7 @@ export default function Home() {
         selectedIso={selectedIso}
         onPick={select}
         onSurprise={surprise}
+        pickerRequest={pickerRequest}
       />
 
       {/* Region rail.
@@ -479,9 +697,9 @@ export default function Home() {
           the chart surface. The rail wraps to as many rows as it needs; it grows
           upward from its bottom anchor, which is free. */}
       <div
-        className={`pointer-events-none absolute inset-x-0 z-30 flex justify-center px-3 sm:left-gutter sm:px-0 ${
-          selected || playerActive ? "sm:right-[26.5rem]" : "sm:right-gutter"
-        } ${selected ? "bottom-[calc(var(--sheet-h)+1.25rem)] sm:bottom-gutter" : "bottom-3 sm:bottom-gutter"}`}
+        className={`pointer-events-none absolute inset-x-0 z-30 flex justify-center px-3 lg:left-gutter lg:px-0 ${
+          docked ? "lg:right-[26.5rem]" : "lg:right-gutter"
+        } ${railBottom}`}
       >
         {countries.length > 0 ? (
           <RegionRail countries={countries} region={regionFilter} onRegion={setRegionFilter} />
@@ -494,27 +712,29 @@ export default function Home() {
           every country switch — only on the queue, which outlives the chart. The
           rail also stays mounted with no country selected so closing the panel
           does not take the transport controls with it. */}
-      {selected || playerActive ? (
+      {selectedMeta || playerActive ? (
         <aside
-          className={`fixed right-3 bottom-3 left-3 z-30 flex flex-col gap-2.5 sm:right-gutter sm:bottom-gutter sm:left-auto sm:w-[384px] ${
-            selected
+          className={`fixed right-3 bottom-3 left-3 z-30 flex flex-col gap-2.5 lg:right-gutter lg:bottom-gutter lg:left-auto lg:w-[384px] ${
+            selectedMeta
               ? sheetOpen
-                ? // Height is the variable, not `48vh`, so it matches `sheetReserve`
-                  // exactly — the rail and the globe read the same number that
-                  // positions this box, and folding moves them together.
-                  "h-[var(--sheet-h)] sm:h-[calc(100vh-2.5rem)]"
+                ? // Height is the resolved variable, not a copy of `48vh`, so it
+                  // matches the reserve exactly — the rail and the globe read the
+                  // same number that positions this box, and folding moves them
+                  // together. The player is inside this height, not added to it,
+                  // so it can never overlap the list.
+                  "h-[var(--sheet-h)] lg:h-[calc(100vh-2.5rem)]"
                 : "h-auto"
               : ""
           }`}
           aria-label="Chart and player"
         >
-          {selected ? (
+          {selectedMeta ? (
             sheetOpen ? (
               <div className="min-h-0 flex-1">
                 <ChartPanel
-                  iso={selected.iso}
-                  name={selected.name}
-                  region={selected.region}
+                  iso={selectedMeta.iso}
+                  name={selectedMeta.name}
+                  region={selectedMeta.region}
                   data={data}
                   loading={loading}
                   error={error}
@@ -524,35 +744,43 @@ export default function Home() {
                   isPlaying={isPlaying}
                   isPaused={activeVideoId != null && !isPlaying}
                   onTab={changeTab}
-                  onPlay={(i) => playFromChart(data?.tracks ?? [], i)}
+                  onPlay={playFromChartAt}
                   onRetry={retry}
+                  onFindCharted={findCharted}
                   onClose={closePanel}
                   // Narrow layouts only: wide has a rail, and a collapse chevron
                   // there would promise a fold that does not exist.
                   onFold={isWide ? undefined : foldSheet}
+                  foldRef={foldRef}
                 />
               </div>
             ) : (
               <div className="shrink-0">
                 <ChartPeek
-                  iso={selected.iso}
-                  name={selected.name}
-                  region={selected.region}
+                  iso={selectedMeta.iso}
+                  name={selectedMeta.name}
+                  region={selectedMeta.region}
                   data={data}
                   loading={loading}
+                  kind={kind}
                   onExpand={unfoldSheet}
+                  buttonRef={peekRef}
                 />
               </div>
             )
           ) : null}
           {playerActive ? (
-            <div className="shrink-0">
+            <div ref={playerBoxRef} className="shrink-0">
               <NowPlaying
                 tracks={queue}
                 activeIndex={activeIndex}
                 onSelect={setActiveIndex}
                 onEnded={playNext}
-                onPlayingChange={setIsPlaying}
+                onTrackError={handleTrackError}
+                queueError={queueError}
+                onRetryQueue={retryQueue}
+                onPlayingChange={handlePlayingChange}
+                handleRef={playerHandle}
               />
             </div>
           ) : null}
@@ -562,8 +790,20 @@ export default function Home() {
       {/* Screen-reader only: the globe is not navigable, so announce what a
           keyboard user just selected. */}
       <p className="sr-only" aria-live="polite">
-        {selected
-          ? `${selected.name} chart, ${kind === "songs" ? "top songs" : "top videos"}. ${loading ? "Loading." : data ? `${data.tracks.length} tracks.` : error ? `Error: ${error}` : ""}`
+        {selectedMeta
+          ? `${selectedMeta.name} chart, ${kind === "songs" ? "top songs" : "top videos"}. ${
+              loading
+                ? "Loading."
+                : error
+                  ? `Error: ${error}`
+                  : data
+                    ? data.country === selectedIso
+                      ? data.charted
+                        ? `${data[kind].length} ${kind}.`
+                        : "No official chart."
+                      : ""
+                    : ""
+            }`
           : ""}
       </p>
 
@@ -593,7 +833,7 @@ export default function Home() {
       {/* Empty stage: a sentence in the middle of the sphere, not a floating
           card. The globe remains the thing to touch — and only appears once it
           is actually interactive, so it never collides with the loading copy. */}
-      {!selected && globeReady ? (
+      {!selectedMeta && globeReady ? (
         <div className="pointer-events-none absolute inset-x-0 top-1/2 z-20 -translate-y-1/2 px-6 text-center">
           <p className="eyebrow chrome-text text-ink/75">Nothing selected</p>
           <p className="display chrome-text mt-1.5 text-title text-ink">

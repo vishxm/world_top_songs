@@ -1,4 +1,4 @@
-import type { ChartWeek } from "~/lib/analyticsCharts";
+import type { ChartWeek } from "~/lib/chartTypes";
 
 /** 6.5M / 42.1K / 908 — short enough for a dense row, never wraps. */
 export function fmtViews(n: number): string {
@@ -39,6 +39,29 @@ export function fmtWeek(week: ChartWeek | null): string {
     return `${fmtDay(week.start)} – ${fmtDay(week.end)}`;
   }
   return fmtDay(week.start);
+}
+
+const CLOCK = new Intl.DateTimeFormat("en-US", {
+  hour: "numeric",
+  minute: "2-digit",
+});
+const DATE_CLOCK = new Intl.DateTimeFormat("en-US", {
+  month: "short",
+  day: "numeric",
+  hour: "numeric",
+  minute: "2-digit",
+});
+
+/**
+ * "fetched 2:31 PM" for today, "fetched Oct 20, 2:31 PM" otherwise. The fetch
+ * time is what makes live/stale judgeable, so it is never hidden behind a
+ * tooltip — but it stays small and muted beside the chart week.
+ */
+export function fmtFetched(iso: string): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "";
+  const sameDay = date.toDateString() === new Date().toDateString();
+  return `fetched ${sameDay ? CLOCK.format(date) : DATE_CLOCK.format(date)}`;
 }
 
 export function fmtDuration(seconds: number): string {

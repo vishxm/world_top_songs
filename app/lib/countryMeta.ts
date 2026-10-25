@@ -259,3 +259,13 @@ export function countryName(iso: string): string | null {
 export function countryRegion(iso: string): Region | null {
   return COUNTRY_META[iso]?.region ?? null;
 }
+
+/**
+ * The selection allowlist, available before the caps layer is fetched: the map
+ * loader builds its countries from exactly these ISOs, so a two-letter code the
+ * metadata knows is a valid selection and its chart can start loading while the
+ * map assets are still in flight.
+ */
+export function isKnownCountry(iso: string | null | undefined): iso is string {
+  return !!iso && /^[A-Z]{2}$/.test(iso) && Object.hasOwn(COUNTRY_META, iso);
+}

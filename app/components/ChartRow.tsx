@@ -1,5 +1,5 @@
 import { memo } from "react";
-import type { ChartTrack } from "~/lib/analyticsCharts";
+import type { ChartTrack } from "~/lib/chartTypes";
 import { fmtViews } from "~/lib/format";
 import { Pill } from "./ui";
 
@@ -19,24 +19,39 @@ function Equalizer() {
   );
 }
 
-function Movement({ track }: { track: ChartTrack }) {
+function movementOf(track: ChartTrack) {
   if (track.trend === "new" || track.previousRank == null) {
+    return { trend: "new" as const, diff: 0, label: "new to the chart" };
+  }
+  if (track.trend === "same") {
+    return { trend: "same" as const, diff: 0, label: "holding its position" };
+  }
+  const diff = Math.abs(track.previousRank - track.rank);
+  return {
+    trend: track.trend,
+    diff,
+    label: `${track.trend === "up" ? "up" : "down"} ${diff} from last week`,
+  };
+}
+
+function Movement({ track }: { track: ChartTrack }) {
+  const movement = movementOf(track);
+  if (movement.trend === "new") {
     return (
       <Pill tone="new" title="New to the chart this week">
         NEW
       </Pill>
     );
   }
-  if (track.trend === "same") return <Pill title="Holding its position">—</Pill>;
-  const up = track.trend === "up";
-  const diff = Math.abs(track.previousRank - track.rank);
+  if (movement.trend === "same") return <Pill title="Holding its position">—</Pill>;
+  const up = movement.trend === "up";
   return (
     <Pill
       tone={up ? "up" : "down"}
-      title={`${up ? "Up" : "Down"} ${diff} from last week (#${track.previousRank})`}
+      title={`${up ? "Up" : "Down"} ${movement.diff} from last week (#${track.previousRank})`}
     >
       {up ? "▲" : "▼"}
-      {diff}
+      {movement.diff}
     </Pill>
   );
 }
@@ -54,12 +69,16 @@ interface Props {
 
 export default memo(function ChartRow({ track, index, isActive, isPlaying, isPaused, onPlay }: Props) {
   const live = isActive && isPlaying;
+  // The row is a transport control for the loaded track and a play button for
+  // everything else. The label has to say which one it will do.
+  const action = live ? "Pause" : isActive && isPaused ? "Resume" : "Play";
   return (
     <li>
       <button
         type="button"
         onClick={() => onPlay(index)}
         aria-current={isActive ? "true" : undefined}
+        aria-label={`${action} ${track.title} by ${track.artists}, rank ${track.rank}, ${movementOf(track).label}`}
         className={`group relative flex w-full items-center gap-3 rounded-control py-2 pr-2.5 pl-3 text-left transition-colors ${
           isActive ? "bg-raised" : "hover:bg-raised/70"
         }`}

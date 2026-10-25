@@ -11,6 +11,18 @@ interface Props {
   countries: StageCountry[];
   selectedIso: string | null;
   onPick: (c: StageCountry) => void;
+  /**
+   * A request from elsewhere in the app (the no-chart notice) to open the
+   * picker with a filter already applied. `id` must change per request, so
+   * closing the dialog and pressing the notice again reopens it.
+   */
+  request?: PickerRequest | null;
+}
+
+export interface PickerRequest {
+  id: number;
+  /** Show only countries with an official weekly chart. */
+  chartedOnly: boolean;
 }
 
 /**
@@ -96,9 +108,13 @@ function rankName(needle: string, name: string): number {
   return needle.length >= 2 && isSubsequence(needle, name) ? 7 : Infinity;
 }
 
-export default function CountryPicker({ countries, selectedIso, onPick }: Props) {
+export default function CountryPicker({ countries, selectedIso, onPick, request }: Props) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
+  /** Restrict the list to countries the chart source actually publishes for.
+   *  Set by an external request (the no-chart notice) and clearable from the
+   *  chip in the search row, so the filter never traps the user. */
+  const [chartedOnly, setChartedOnly] = useState(false);
   const [cursor, setCursor] = useState(0);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
@@ -119,20 +135,25 @@ export default function CountryPicker({ countries, selectedIso, onPick }: Props)
     [countries]
   );
 
+  const available = useMemo(
+    () => (chartedOnly ? entries.filter((entry) => isChartCountry(entry.country.iso)) : entries),
+    [entries, chartedOnly]
+  );
+
   const results = useMemo(() => {
     const needle = fold(query.trim());
-    if (!needle) return entries;
-    return entries
+    if (!needle) return available;
+    return available
       .map((entry) => ({ entry, score: rank(needle, entry) }))
       .filter((x) => x.score < Infinity)
       .sort((a, b) => a.score - b.score || a.entry.name.localeCompare(b.entry.name))
       .map((x) => x.entry);
-  }, [entries, query]);
+  }, [available, query]);
 
   const grouped = useMemo(() => {
     if (query.trim()) return null; // a flat, ranked list reads better while typing
     const byRegion = new Map<Region, Entry[]>();
-    for (const entry of entries) {
+    for (const entry of available) {
       const list = byRegion.get(entry.country.region) ?? [];
       list.push(entry);
       byRegion.set(entry.country.region, list);
@@ -148,7 +169,7 @@ export default function CountryPicker({ countries, selectedIso, onPick }: Props)
       start += list.length;
     }
     return groups;
-  }, [entries, query]);
+  }, [available, query]);
 
   /**
    * The order the list is actually rendered in: region order while grouped,
@@ -189,12 +210,28 @@ export default function CountryPicker({ countries, selectedIso, onPick }: Props)
 
   // Reset on every close, whichever way it happened — Escape, a selection, a
   // backdrop click, or the shortcut pressed a second time. Reopening always
-  // starts with the region-grouped list rather than yesterday's search.
+  // starts with the region-grouped, unfiltered list rather than yesterday's
+  // search or a filter it inherited from the no-chart notice.
   useEffect(() => {
     if (open) return;
     setQuery("");
     setCursor(0);
+    setChartedOnly(false);
   }, [open]);
+
+  // A request from outside the picker (the no-chart notice's action) opens it
+  // with a filter already applied. The ref makes each request fire once: the
+  // route keeps the same object after the user closes the dialog, and a
+  // re-render must not reopen what they just dismissed.
+  const handledRequest = useRef(0);
+  useEffect(() => {
+    if (!request || request.id === handledRequest.current) return;
+    handledRequest.current = request.id;
+    setQuery("");
+    setCursor(0);
+    setChartedOnly(request.chartedOnly);
+    setOpen(true);
+  }, [request]);
 
   // Focus the search box while open, lock the page behind the dialog, and put
   // focus back on the trigger on close so a keyboard user is never dropped on
@@ -217,7 +254,7 @@ export default function CountryPicker({ countries, selectedIso, onPick }: Props)
     };
   }, [open]);
 
-  useEffect(() => setCursor(0), [query]);
+  useEffect(() => setCursor(0), [query, chartedOnly]);
 
   // Keep the active option in view during keyboard navigation.
   useEffect(() => {
@@ -280,8 +317,12 @@ export default function CountryPicker({ countries, selectedIso, onPick }: Props)
     countries.length === 0
       ? "Loading countries…"
       : query.trim()
-        ? `No country matches “${query.trim()}”.`
-        : "No countries are available.";
+        ? chartedOnly
+          ? `No charted country matches “${query.trim()}”.`
+          : `No country matches “${query.trim()}”.`
+        : chartedOnly
+          ? "No charted countries are available."
+          : "No countries are available.";
 
   return (
     <>
@@ -323,6 +364,7 @@ export default function CountryPicker({ countries, selectedIso, onPick }: Props)
                 role="dialog"
                 aria-modal="true"
                 aria-label="Pick a country"
+                data-charted-only={chartedOnly ? "true" : "false"}
                 onKeyDown={onDialogKeyDown}
                 className="surface-pop relative w-full max-w-lg overflow-hidden motion-safe:animate-rise"
               >
@@ -341,11 +383,25 @@ export default function CountryPicker({ countries, selectedIso, onPick }: Props)
                     aria-label="Search countries"
                     placeholder={
                       countries.length > 0
-                        ? `Search ${countries.length} countries…`
+                        ? chartedOnly
+                          ? "Search charted countries…"
+                          : `Search ${countries.length} countries…`
                         : "Search countries…"
                     }
                     className="min-w-0 flex-1 bg-transparent text-body text-ink outline-none placeholder:text-faint"
                   />
+                  {chartedOnly ? (
+                    <button
+                      type="button"
+                      onClick={() => setChartedOnly(false)}
+                      title="Show all countries, including those without an official chart"
+                      className="chip shrink-0"
+                    >
+                      Charted only
+                      <X className="h-3 w-3" aria-hidden />
+                      <span className="sr-only">, show all countries</span>
+                    </button>
+                  ) : null}
                   <button
                     type="button"
                     onClick={close}
@@ -410,16 +466,20 @@ export default function CountryPicker({ countries, selectedIso, onPick }: Props)
                     <kbd className="kbd">↵</kbd> select
                     <kbd className="kbd">esc</kbd> close
                   </span>
-                  <span className="flex items-center gap-3">
-                    <span className="flex items-center gap-1.5">
-                      <span aria-hidden className="h-1.5 w-1.5 rounded-full bg-muted" />
-                      Charted
+                  {chartedOnly ? (
+                    <span className="tnum">{available.length} charted</span>
+                  ) : (
+                    <span className="flex items-center gap-3">
+                      <span className="flex items-center gap-1.5">
+                        <span aria-hidden className="h-1.5 w-1.5 rounded-full bg-muted" />
+                        Charted
+                      </span>
+                      <span className="flex items-center gap-1.5">
+                        <span aria-hidden className="h-1.5 w-1.5 rounded-full border border-faint/70" />
+                        Uncharted
+                      </span>
                     </span>
-                    <span className="flex items-center gap-1.5">
-                      <span aria-hidden className="h-1.5 w-1.5 rounded-full border border-faint/70" />
-                      Uncharted
-                    </span>
-                  </span>
+                  )}
                 </div>
               </div>
             </div>,

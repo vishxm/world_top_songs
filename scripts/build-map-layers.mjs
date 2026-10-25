@@ -1,16 +1,22 @@
 // Split the render map into the two layers the globe actually draws:
 //
-//   public/country-caps.geojson    - one fill+hit target per country, built from
-//                                    the largest polygon parts only (~250 objects)
-//   public/country-borders.geojson - EVERY 50m border ring merged into a single
-//                                    MultiLineString (1 object, 1 draw call)
+//   public/country-caps.geojson    - one fill per country, built from the largest
+//                                    polygon parts only (~250 objects)
+//   public/country-borders.geojson - EVERY 50m ring merged into a single
+//                                    MultiLineString (1 object, 1 draw call), plus
+//                                    the part grouping the hit layer is built from
 //
 // Why: three-globe turns each polygon part into its own Mesh+LineSegments pair.
 // The simplified 50m map has ~1650 parts (island nations dominate), which meant
-// ~8200 draw calls a frame and a 18fps globe. Caps carry the interaction, borders
-// carry the detail, so caps can be pruned and borders can be merged.
+// ~8200 draw calls a frame and a 18fps globe. So caps are pruned to the parts that
+// carry the country's visual mass, while the border layer carries every ring at
+// full fidelity in one draw call.
 //
-// Dropped cap parts stay visible as outlines — the border layer is full fidelity.
+// Pruned cap parts must still be clickable (Hawaii, the Canaries, Jeju, Pacific
+// islands...), so the border layer also records which ring indices form each
+// polygon part and which ISO they belong to. `app/lib/hitLayer.ts` turns that
+// grouping into the full-land meshes that picking raycasts — the caps are only
+// ever visual.
 //
 // Usage:  node scripts/build-map-layers.mjs
 // Input:  public/world-50m-simple.geojson (what the globe renders; winding-correct)
@@ -95,15 +101,27 @@ const chart = chartCountries();
 
 // ---------------------------------------------------------------- borders
 // Every ring of every feature, outer and hole alike, as one MultiLineString.
+// Alongside it, `parts` groups those ring indices back into the polygons they
+// came from: the first ring is the outer boundary and the rest are holes. This is
+// the only place the full-fidelity land geometry exists, so it is what the hit
+// layer is built from — the caps are a pruned subset and must never decide what
+// can be clicked.
 const borderLines = [];
+const landParts = [];
 let borderRings = 0;
 for (const f of src.features) {
+  const iso = isoOf(f.properties);
   for (const poly of partsOf(f.geometry)) {
+    const rings = [];
     for (const ring of poly) {
       if (ring.length < 2) continue;
+      rings.push(borderLines.length);
       borderLines.push(roundCoords(ring, 4));
       borderRings++;
     }
+    // No ISO means a disputed unit we deliberately do not make selectable
+    // (Kosovo, Somaliland, N. Cyprus, Siachen...). Its rings are still drawn.
+    if (iso && rings.length > 0) landParts.push({ iso, rings });
   }
 }
 const borders = {
@@ -111,7 +129,7 @@ const borders = {
   features: [
     {
       type: "Feature",
-      properties: { kind: "borders" },
+      properties: { kind: "borders", parts: landParts },
       geometry: { type: "MultiLineString", coordinates: borderLines },
     },
   ],
@@ -173,5 +191,5 @@ writeFileSync(BORDERS_OUT, JSON.stringify(borders));
 
 const capParts = caps.reduce((n, f) => n + partsOf(f.geometry).length, 0);
 console.log(`caps    ${selectable} countries / ${capParts} parts  (dropped ${droppedParts})`);
-console.log(`borders ${borderRings} rings in 1 MultiLineString`);
+console.log(`borders ${borderRings} rings in 1 MultiLineString, ${landParts.length} parts grouped for the hit layer`);
 console.log(`wrote ${CAPS_OUT} + ${BORDERS_OUT}`);

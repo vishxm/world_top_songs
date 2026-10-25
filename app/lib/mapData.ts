@@ -3,13 +3,14 @@ import { COUNTRY_META, type Region } from "~/lib/countryMeta";
 // The two layers the globe draws, built by scripts/build-map-layers.mjs and
 // gated by scripts/map-layers-check.mjs:
 //
-//   caps     - one fill + hit target per country, pruned to the parts that carry
-//              its visual mass (~266 objects total)
-//   borders  - every 50m border ring merged into a single MultiLineString, drawn
-//              as one LineSegments, so the outline stays full-fidelity while the
-//              interaction layer stays cheap
+//   caps  - one fill per country, pruned to the parts that carry its visual mass
+//           (~266 objects total). Caps are visual only.
+//   land  - every 50m border ring in one MultiLineString (1 draw call), plus the
+//           ring-index grouping that app/lib/hitLayer.ts turns into the full-land
+//           picking meshes. This is what makes pruned islands — Hawaii, the
+//           Canaries, Jeju — clickable.
 export const CAPS_URL = "/country-caps.geojson";
-export const BORDERS_URL = "/country-borders.geojson";
+export const LAND_URL = "/country-borders.geojson";
 
 export interface CountryCap {
   iso: string;
@@ -26,8 +27,26 @@ export interface CountryCap {
 
 export type BorderGeometry = [number, number][][];
 
+/** One polygon part: outer ring first, then holes. */
+export interface LandPart {
+  iso: string;
+  rings: BorderGeometry;
+}
+
+export interface LandLayer {
+  /** Every ring, in draw order. */
+  rings: BorderGeometry;
+  /** Every part with an ISO, grouped so the hit layer can rebuild it. */
+  parts: LandPart[];
+}
+
 interface RawFeature {
-  properties?: { ISO_A2?: string; NAME?: string; CONTINENT?: string };
+  properties?: {
+    ISO_A2?: string;
+    NAME?: string;
+    CONTINENT?: string;
+    parts?: { iso?: unknown; rings?: unknown }[];
+  };
   geometry?: { type?: string; coordinates?: unknown };
 }
 
@@ -146,13 +165,28 @@ export async function loadCountryCaps(signal?: AbortSignal): Promise<CountryCap[
   return capsFromGeoJson(await fetchGeoJson(CAPS_URL, signal));
 }
 
-/** [[lng, lat], ...][] — straight from the merged MultiLineString. */
-export async function loadBorderGeometry(signal?: AbortSignal): Promise<BorderGeometry> {
-  const geo = await fetchGeoJson(BORDERS_URL, signal);
+/** Every ring, plus the part grouping, straight from the land layer. */
+export async function loadLandLayer(signal?: AbortSignal): Promise<LandLayer> {
+  const geo = await fetchGeoJson(LAND_URL, signal);
   const f = geo.features?.[0];
   const coords = (f?.geometry as { type?: string; coordinates?: unknown } | undefined)?.coordinates;
   if (f?.geometry?.type !== "MultiLineString" || !Array.isArray(coords)) {
-    throw new Error("border layer is not a MultiLineString");
+    throw new Error("land layer is not a MultiLineString");
   }
-  return coords as BorderGeometry;
+  const rings = coords as BorderGeometry;
+  const parts: LandPart[] = [];
+  for (const raw of f.properties?.parts ?? []) {
+    const iso = raw?.iso;
+    const indices = raw?.rings;
+    if (typeof iso !== "string" || !Array.isArray(indices)) continue;
+    const partRings: BorderGeometry = [];
+    for (const index of indices) {
+      if (typeof index !== "number") continue;
+      const ring = rings[index];
+      if (Array.isArray(ring)) partRings.push(ring);
+    }
+    if (partRings.length > 0) parts.push({ iso, rings: partRings });
+  }
+  if (parts.length === 0) throw new Error("land layer has no part grouping");
+  return { rings, parts };
 }
