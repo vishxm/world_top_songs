@@ -20,6 +20,40 @@ import type { Ray } from "three";
 export const GLOBE_RADIUS = 100;
 
 /**
+ * Altitude of the rendered country caps, in globe-radius units.
+ *
+ * THE INVARIANT: never 0. three-globe builds polygon geometry at GLOBE_RADIUS
+ * and applies altitude as a uniform mesh scale of `1 + alt`, so an altitude of 0
+ * puts the cap exactly coplanar with the globe mesh — it z-fights and the pick
+ * becomes numerically unreliable, silently dropping countries from hover. This
+ * is also high enough to sit clear of the border layer's radius.
+ */
+export const CAP_BASE = 0.004;
+
+/**
+ * Altitude of a selected cap. The lift is the selection's second signal: it
+ * survives the region filter dimming the fill. Hover must never lift, because a
+ * lift is a scale and therefore grows the cap's footprint over its neighbours.
+ */
+export const CAP_SELECTED = 0.03;
+
+/**
+ * Altitude of the full-land hit layer. The picking surface is independent of the
+ * drawn caps (which are pruned); keeping it at the base cap altitude means a ray
+ * resolves the same surface the user sees.
+ */
+export const HIT_ALTITUDE = CAP_BASE;
+
+/**
+ * Two co-located caps — an enclave and its host, a city-state and the country
+ * around it — are at the same altitude, so their hit distances differ only by
+ * tessellation sag (fractions of a unit). Inside this window the smaller country
+ * wins; outside it the nearest hit wins. Without the window, clicking Lesotho
+ * was a coin flip between Lesotho and South Africa, decided by triangle order.
+ */
+export const PICK_EPSILON = 0.5;
+
+/**
  * Distance from the ray origin to where it meets the globe's own surface, or
  * `Infinity` if it never does.
  *
@@ -68,4 +102,44 @@ export function firstUnoccluded<T extends { distance: number }>(
   const hit = hits[0];
   if (!hit) return null;
   return hit.distance < occluderDistance ? hit : null;
+}
+
+/**
+ * The nearest unoccluded hit, with a size tiebreak for co-located caps.
+ *
+ * `firstUnoccluded` answers "is the frontmost thing in front of the planet?".
+ * This adds the micro-state rule: among hits within `epsilon` of the frontmost
+ * one — an enclave inside its host, a city-state inside its neighbour, two
+ * islands whose caps overlap by a rounding error — the smallest country (by
+ * `sizeOf`, the app's bbox span) wins. All caps in the hit layer share one
+ * altitude, so "within epsilon" is exactly the set that is visually on top of
+ * each other; a genuinely nearer surface is farther than that and still wins.
+ *
+ * `hits` must be sorted near→far, which `Raycaster.intersectObjects` guarantees.
+ * Every candidate is still checked against the planet, so a ray cannot reach
+ * through the globe into a tie on the far side.
+ */
+export function nearestUnoccluded<T extends { distance: number }>(
+  hits: readonly T[],
+  occluderDistance: number,
+  epsilon: number,
+  sizeOf: (hit: T) => number
+): T | null {
+  const first = firstUnoccluded(hits, occluderDistance);
+  if (!first) return null;
+
+  let best = first;
+  let bestSize = sizeOf(first);
+  for (let i = 1; i < hits.length; i++) {
+    const hit = hits[i];
+    // Sorted, so once the window closes no later hit can re-enter it.
+    if (hit.distance - first.distance > epsilon) break;
+    if (hit.distance >= occluderDistance) break;
+    const size = sizeOf(hit);
+    if (size < bestSize) {
+      best = hit;
+      bestSize = size;
+    }
+  }
+  return best;
 }

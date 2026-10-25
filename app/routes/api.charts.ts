@@ -1,163 +1,137 @@
-import { fetchCountryCharts, type ChartTrack, type ChartWeek } from "~/lib/analyticsCharts";
-// Legacy pipeline: only used for the Global fallback (videos).
-import { fetchCountryTop10 } from "~/lib/innertube";
-import { fetchSpotifyWeekly } from "~/lib/spotifyKworb";
-import { resolveMany } from "~/lib/ytResolve";
-import { getFresh, getLastGood, setCached } from "~/lib/cache";
-import { SEEDS } from "~/lib/seed";
-import { SEED_SONGS } from "~/lib/seedSongs";
+import { fetchCountryCharts, type CountryCharts } from "~/lib/analyticsCharts";
+import {
+  clearCached,
+  getFresh,
+  getLastGood,
+  setCached,
+  type CachedCharts,
+} from "~/lib/cache";
 import { CHART_COUNTRIES } from "~/lib/countries";
+import { NO_CHART_REASON, type ChartSource } from "~/lib/chartTypes";
 
-type ChartKind = "songs" | "videos";
+/** Both tabs show the same depth. The upstream returns 100 of each; 20 is a
+ *  deliberate slice, not everything that fits in a panel. */
+const CHART_SIZE = 20;
 
-function toChartTracks(
-  tracks: Array<{ rank: number; videoId: string; title: string; artists: string; thumbnail: string }>
-): ChartTrack[] {
-  return tracks.map((t) => ({
-    rank: t.rank,
-    videoId: t.videoId,
-    title: t.title,
-    artists: t.artists,
-    weeklyViews: 0,
-    thumbnail: t.thumbnail,
-    previousRank: null,
-    weeksOnChart: null,
-    trend: "same" as const,
-  }));
+/** Live: cacheable in the browser and at the CDN. The in-process cache is a
+ *  second tier beneath them, so a warm request never leaves the server. */
+const LIVE_CACHE = "public, max-age=300, s-maxage=300, stale-while-revalidate=86400";
+/** Nothing about a country's chart coverage changes week to week. */
+const NO_CHART_CACHE = "public, max-age=3600, s-maxage=86400, stale-while-revalidate=604800";
+/** Stale and failed responses must not be pinned by the browser or the CDN:
+ *  the next retry has to be free to reach the upstream again. */
+const NO_STORE = "no-store";
+
+/**
+ * Concurrent requests for one country share a single upstream fetch. Two tabs
+ * opened in quick succession (or a prefetch that lands just before a click)
+ * would otherwise both pay the keyless upstream's ~1.5s.
+ */
+const inflight = new Map<string, Promise<CountryCharts>>();
+
+function fetchOnce(country: string): Promise<CountryCharts> {
+  const existing = inflight.get(country);
+  if (existing) return existing;
+  const pending = fetchCountryCharts(country).finally(() => inflight.delete(country));
+  inflight.set(country, pending);
+  return pending;
 }
 
-function seedFor(kind: ChartKind, country: string): ChartTrack[] {
-  if (kind === "songs") return SEED_SONGS[country] ?? SEED_SONGS.US;
-  return toChartTracks(SEEDS[country] ?? SEEDS.ZZ);
-}
-
-function respond(
-  base: { country: string; chartCountry: string; fallback: boolean },
-  entry: {
-    tracks: ChartTrack[];
-    playlistTitle: string;
-    week: ChartWeek | null;
-    chartKind: string;
-    provider: "youtube" | "spotify";
-  },
-  source: "live" | "stale" | "seed",
-  note?: string
-) {
-  return Response.json({ ...base, ...entry, source, ...(note ? { note } : {}) });
-}
-
-/** Spotify fallback for countries YouTube doesn't chart: weekly Spotify
- *  ranks resolved to playable YouTube videos. Needs >=5 confident matches
- *  or it throws and the caller falls through to the Global chart. */
-async function spotifyTop10(raw: string): Promise<{ tracks: ChartTrack[]; playlistTitle: string }> {
-  const entries = await fetchSpotifyWeekly(raw.toLowerCase());
-  const resolved = await resolveMany(
-    entries.slice(0, 12).map((e) => ({ artist: e.artist, title: e.title })),
-    3
-  );
-  const tracks: ChartTrack[] = [];
-  entries.slice(0, 12).forEach((e, i) => {
-    const r = resolved[i];
-    if (!r || tracks.length >= 10) return;
-    tracks.push({
-      rank: tracks.length + 1,
-      videoId: r.videoId,
-      title: r.title,
-      artists: r.artists,
-      weeklyViews: 0,
-      thumbnail: r.thumbnail,
-      previousRank: e.movement == null || e.movement === 0 ? null : e.rank + e.movement,
-      weeksOnChart: null,
-      trend: e.movement == null ? "same" : e.movement === 0 ? "same" : e.movement > 0 ? "up" : "down",
-    });
+function cacheable(charts: CountryCharts): CachedCharts {
+  return setCached(charts.country, {
+    week: charts.week,
+    // Trim before caching rather than on the way out: 68 countries × 200 tracks
+    // is a lot of strings to keep warm for a panel that can only show 40.
+    songs: charts.songs.slice(0, CHART_SIZE),
+    videos: charts.videos.slice(0, CHART_SIZE),
   });
-  if (tracks.length < 5) throw new Error(`only ${tracks.length} tracks resolved`);
-  return { tracks, playlistTitle: "Spotify Weekly" };
+}
+
+function charted(entry: CachedCharts, source: ChartSource): Response {
+  return Response.json(
+    {
+      charted: true,
+      country: entry.country,
+      week: entry.week,
+      source,
+      fetchedAt: new Date(entry.fetchedAt).toISOString(),
+      // Both kinds travel together: the browser can switch tabs without a
+      // second round trip, and the CDN caches one representation instead of two
+      // near-identical ones.
+      songs: entry.songs,
+      videos: entry.videos,
+    },
+    { headers: { "Cache-Control": source === "live" ? LIVE_CACHE : NO_STORE } }
+  );
+}
+
+/**
+ * Dev-only fault injection so the browser gate can prove the stale and
+ * no-last-good paths over real HTTP. The headers are ignored in production
+ * builds unless `WTS_TEST_HOOKS=1` is set on the gate's own server; there is no
+ * switch a deployed client can reach.
+ */
+function testHooksEnabled(): boolean {
+  return process.env.NODE_ENV !== "production" || process.env.WTS_TEST_HOOKS === "1";
+}
+
+function upstreamFailureRequested(request: Request): boolean {
+  return testHooksEnabled() && request.headers.get("x-wts-upstream-failure") === "1";
+}
+
+function cacheResetRequested(request: Request): boolean {
+  return testHooksEnabled() && request.headers.get("x-wts-clear-cache") === "1";
 }
 
 export async function loader({ request }: { request: Request }) {
   const url = new URL(request.url);
-  const raw = (url.searchParams.get("country") ?? "").toUpperCase();
-  const kind = url.searchParams.get("type") === "videos" ? "videos" : "songs";
-  if (!/^[A-Z]{2}$/.test(raw)) {
-    return Response.json({ error: "country must be an ISO 3166-1 alpha-2 code" }, { status: 400 });
+  const country = (url.searchParams.get("country") ?? "").trim().toUpperCase();
+
+  if (!/^[A-Z]{2}$/.test(country)) {
+    return Response.json(
+      { error: "country must be an ISO 3166-1 alpha-2 code" },
+      { status: 400, headers: { "Cache-Control": NO_STORE } }
+    );
   }
 
-  const supported = raw in CHART_COUNTRIES;
-  const base = { country: raw, chartCountry: supported ? raw : "ZZ", fallback: !supported };
-
-  // Unsupported country -> Spotify weekly (resolved to YouTube), else Global videos.
-  if (!supported) {
-    const spotKey = `${raw}:spotify`;
-    const spotFresh = getFresh(spotKey);
-    if (spotFresh) return respond(base, spotFresh, "live");
-    try {
-      const { tracks, playlistTitle } = await spotifyTop10(raw);
-      const entry = setCached(spotKey, {
-        tracks,
-        playlistTitle,
-        week: null,
-        chartKind: "songs",
-        provider: "spotify",
-      });
-      return respond(base, entry, "live");
-    } catch {
-      // No Spotify chart either -> Global videos fallback.
-    }
-    const key = `ZZ:videos`;
-    const fresh = getFresh(key);
-    if (fresh) return respond(base, fresh, "live");
-    try {
-      const { tracks, playlistTitle } = await fetchCountryTop10("ZZ");
-      const entry = setCached(key, {
-        tracks: toChartTracks(tracks),
-        playlistTitle,
-        week: null,
-        chartKind: "videos",
-        provider: "youtube",
-      });
-      return respond(base, entry, "live");
-    } catch (e) {
-      const stale = getLastGood(key);
-      if (stale) return respond(base, stale, "stale");
-      return respond(
-        base,
-        { tracks: seedFor("videos", "ZZ"), playlistTitle: "Top Music Videos", week: null, chartKind: "videos", provider: "youtube" },
-        "seed",
-        `live charts unreachable (${e instanceof Error ? e.message : "unknown error"})`
-      );
-    }
+  // An uncharted country is a 200 with an explicit payload, not an error and
+  // not a borrowed chart. It is never filled with another country's data.
+  if (!(country in CHART_COUNTRIES)) {
+    return Response.json(
+      {
+        charted: false,
+        country,
+        reason: NO_CHART_REASON,
+      },
+      { headers: { "Cache-Control": NO_CHART_CACHE } }
+    );
   }
 
-  const key = `${raw}:${kind}`;
-  const fresh = getFresh(key);
-  if (fresh) return respond(base, fresh, "live");
+  // A retry passes `refresh=1`, which skips the fresh tier. It still falls back
+  // to the last good copy if the upstream is down, marked stale.
+  if (cacheResetRequested(request)) clearCached(country);
+  const refresh = url.searchParams.get("refresh") === "1";
+  if (!refresh) {
+    const cached = getFresh(country);
+    if (cached) return charted(cached, "live");
+  }
 
   try {
-    const charts = await fetchCountryCharts(raw);
-    const list = kind === "songs" ? charts.songs : charts.videos;
-    const entry = setCached(key, {
-      tracks: list.slice(0, 10),
-      playlistTitle: kind === "songs" ? "Weekly Top Songs" : "Weekly Top Music Videos",
-      week: charts.week,
-      chartKind: kind,
-      provider: "youtube",
-    });
-    return respond(base, entry, "live");
-  } catch (e) {
-    const stale = getLastGood(key);
-    if (stale) return respond(base, stale, "stale");
-    return respond(
-      base,
+    if (upstreamFailureRequested(request)) {
+      throw new Error("simulated upstream failure");
+    }
+    return charted(cacheable(await fetchOnce(country)), "live");
+  } catch (error) {
+    console.error(`[charts] ${country} upstream failed:`, error);
+    const lastGood = getLastGood(country);
+    if (lastGood) return charted(lastGood, "stale");
+
+    return Response.json(
       {
-        tracks: seedFor(kind, raw),
-        playlistTitle: kind === "songs" ? "Weekly Top Songs" : "Weekly Top Music Videos",
-        week: null,
-        chartKind: kind,
-        provider: "youtube",
+        error: "The official chart source is unavailable right now. Please try again.",
+        country,
       },
-      "seed",
-      `live charts unreachable (${e instanceof Error ? e.message : "unknown error"})`
+      { status: 502, headers: { "Cache-Control": NO_STORE } }
     );
   }
 }

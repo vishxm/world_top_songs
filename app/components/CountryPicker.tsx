@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
-import { Check, Globe2, Search, Sparkles, X } from "lucide-react";
+import { createPortal } from "react-dom";
+import { Check, Search, X } from "lucide-react";
 import type { Region } from "~/lib/countryMeta";
 import { REGIONS } from "~/lib/countryMeta";
 import { isChartCountry } from "~/lib/countries";
@@ -10,92 +11,241 @@ interface Props {
   countries: StageCountry[];
   selectedIso: string | null;
   onPick: (c: StageCountry) => void;
+  /**
+   * A request from elsewhere in the app (the no-chart notice) to open the
+   * picker with a filter already applied. `id` must change per request, so
+   * closing the dialog and pressing the notice again reopens it.
+   */
+  request?: PickerRequest | null;
 }
 
-/** Lower is better. Exact > prefix > word-boundary > substring > subsequence,
- *  so "India" never loses to "British Indian Ocean Territory". */
-function score(needle: string, name: string, iso: string): number {
-  const n = name.toLowerCase();
-  if (iso.toLowerCase() === needle) return -1;
-  if (n === needle) return 0;
-  if (n.startsWith(needle)) return 1;
-  const wordStart = n.search(new RegExp(`\\b${needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
-  if (wordStart === 0) return 2;
-  if (wordStart > 0) return 3;
-  if (n.includes(needle)) return 4;
-  // Subsequence: "gbr" -> "Gabon"? no. "jp" -> "Japan" via ISO already.
+export interface PickerRequest {
+  id: number;
+  /** Show only countries with an official weekly chart. */
+  chartedOnly: boolean;
+}
+
+/**
+ * Everyday names that appear in neither the display name nor the ISO code.
+ * Deliberately small: this is a convenience for the handful of countries people
+ * type by another name, not a translation layer.
+ */
+const ALIASES: Record<string, readonly string[]> = {
+  AE: ["uae"],
+  CI: ["ivory coast"],
+  CZ: ["czech republic"],
+  GB: ["uk", "britain", "england"],
+  MM: ["burma"],
+  NL: ["holland"],
+  US: ["usa", "america"],
+};
+
+/**
+ * Fold case and diacritics, so "cote" finds "Côte d'Ivoire" and "aland" finds
+ * "Åland Islands". Punctuation is kept: the subsequence fallback below lets
+ * "cote divoire" skip the apostrophe.
+ */
+function fold(value: string): string {
+  return value
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+}
+
+/** A character that starts a new word, so a hit after it outranks a mid-word one. */
+const WORD_BOUNDARY = /[\s'’.\-&(/]/;
+
+function isSubsequence(needle: string, haystack: string): boolean {
   let i = 0;
-  for (const ch of n) if (ch === needle[i]) i++;
-  return i === needle.length ? 5 : Infinity;
+  for (let j = 0; j < haystack.length && i < needle.length; j++) {
+    if (haystack[j] === needle[i]) i++;
+  }
+  return i === needle.length;
 }
 
-export default function CountryPicker({ countries, selectedIso, onPick }: Props) {
+interface Entry {
+  country: StageCountry;
+  iso: string;
+  name: string;
+  aliases: string[];
+}
+
+/**
+ * Lower is better. ISO code outranks name and an exact hit outranks a prefix,
+ * so "in" offers India before Indonesia and "gb" finds the United Kingdom even
+ * though those letters are nowhere in its name. A subsequence match is the last
+ * resort — it keeps a compressed query like "untdst" useful without letting
+ * "India" lose to "British Indian Ocean Territory".
+ */
+function rank(needle: string, entry: Entry): number {
+  if (entry.iso === needle) return 0;
+  if (entry.aliases.includes(needle)) return 1;
+  if (entry.iso.startsWith(needle)) return 2;
+
+  let best = Infinity;
+  for (const name of [entry.name, ...entry.aliases]) {
+    const score = rankName(needle, name);
+    if (score < best) best = score;
+  }
+  return best;
+}
+
+function rankName(needle: string, name: string): number {
+  if (name === needle) return 3;
+  if (name.startsWith(needle)) return 4;
+
+  let at = name.indexOf(needle);
+  if (at >= 0) {
+    while (at >= 0) {
+      if (WORD_BOUNDARY.test(name[at - 1])) return 5;
+      at = name.indexOf(needle, at + 1);
+    }
+    return 6;
+  }
+
+  // Subsequence matching on one character turns the list into noise; the prefix
+  // and substring ranks above already cover every useful single-letter query.
+  return needle.length >= 2 && isSubsequence(needle, name) ? 7 : Infinity;
+}
+
+export default function CountryPicker({ countries, selectedIso, onPick, request }: Props) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
+  /** Restrict the list to countries the chart source actually publishes for.
+   *  Set by an external request (the no-chart notice) and clearable from the
+   *  chip in the search row, so the filter never traps the user. */
+  const [chartedOnly, setChartedOnly] = useState(false);
   const [cursor, setCursor] = useState(0);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
-  const listRef = useRef<HTMLUListElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
   const listId = useId();
 
-  const sorted = useMemo(
-    () => [...countries].sort((a, b) => a.name.localeCompare(b.name)),
+  const entries = useMemo<Entry[]>(
+    () =>
+      [...countries]
+        .sort((a, b) => a.name.localeCompare(b.name))
+        .map((country) => ({
+          country,
+          iso: country.iso.toLowerCase(),
+          name: fold(country.name),
+          aliases: (ALIASES[country.iso] ?? []).map(fold),
+        })),
     [countries]
   );
 
+  const available = useMemo(
+    () => (chartedOnly ? entries.filter((entry) => isChartCountry(entry.country.iso)) : entries),
+    [entries, chartedOnly]
+  );
+
   const results = useMemo(() => {
-    const needle = query.trim().toLowerCase();
-    if (needle.length === 0) return sorted;
-    return sorted
-      .map((c) => ({ c, s: score(needle, c.name, c.iso) }))
-      .filter((x) => x.s < Infinity)
-      .sort((a, b) => a.s - b.s || a.c.name.localeCompare(b.c.name))
-      .map((x) => x.c);
-  }, [query, sorted]);
+    const needle = fold(query.trim());
+    if (!needle) return available;
+    return available
+      .map((entry) => ({ entry, score: rank(needle, entry) }))
+      .filter((x) => x.score < Infinity)
+      .sort((a, b) => a.score - b.score || a.entry.name.localeCompare(b.entry.name))
+      .map((x) => x.entry);
+  }, [available, query]);
 
   const grouped = useMemo(() => {
     if (query.trim()) return null; // a flat, ranked list reads better while typing
-    const byRegion = new Map<Region, StageCountry[]>();
-    for (const c of sorted) {
-      const list = byRegion.get(c.region) ?? [];
-      list.push(c);
-      byRegion.set(c.region, list);
+    const byRegion = new Map<Region, Entry[]>();
+    for (const entry of available) {
+      const list = byRegion.get(entry.country.region) ?? [];
+      list.push(entry);
+      byRegion.set(entry.country.region, list);
     }
-    // Flatten in the same order the two lists below render, so a single running
-    // counter gives every option its index into `results`.
-    const groups: { region: Region; items: StageCountry[] }[] = [];
-    let idx = 0;
+    // Flatten in the same order the groups render, so one running counter gives
+    // every option its index into `visible`.
+    const groups: { region: Region; items: Entry[]; start: number }[] = [];
+    let start = 0;
     for (const region of REGIONS) {
       const list = byRegion.get(region);
       if (!list?.length) continue;
-      groups.push({ region, items: list });
-      idx += list.length;
+      groups.push({ region, items: list, start });
+      start += list.length;
     }
     return groups;
-  }, [query, sorted]);
+  }, [available, query]);
 
-  const close = useCallback(() => {
-    setOpen(false);
-    setQuery("");
-    setCursor(0);
-  }, []);
+  /**
+   * The order the list is actually rendered in: region order while grouped,
+   * ranked order while filtering. Keyboard selection reads from this rather
+   * than from `results` — when the query is empty the two orders differ, and
+   * Enter would otherwise pick whichever country happens to be first
+   * alphabetically rather than the option that is highlighted.
+   */
+  const visible = useMemo(
+    () => (grouped ? grouped.flatMap((group) => group.items) : results),
+    [grouped, results]
+  );
 
-  // Global shortcut. "/" is ignored while the user is typing somewhere else.
+  const close = useCallback(() => setOpen(false), []);
+
+  // Global shortcut. "/" is ignored while the user is typing somewhere else;
+  // ⌘K/Ctrl-K is the escape hatch from anywhere.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement | null;
-      const typing = !!target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable);
-      if ((e.key === "k" && (e.metaKey || e.ctrlKey)) || (e.key === "/" && !typing)) {
+      const typing =
+        !!target &&
+        (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable);
+
+      if ((e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === "k") {
         e.preventDefault();
         setOpen((v) => !v);
+        return;
       }
-      if (e.key === "Escape") close();
+      if (e.key === "/" && !typing && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        e.preventDefault();
+        setOpen(true);
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [close]);
+  }, []);
 
+  // Reset on every close, whichever way it happened — Escape, a selection, a
+  // backdrop click, or the shortcut pressed a second time. Reopening always
+  // starts with the region-grouped, unfiltered list rather than yesterday's
+  // search or a filter it inherited from the no-chart notice.
   useEffect(() => {
-    if (!open) return;
+    if (open) return;
+    setQuery("");
+    setCursor(0);
+    setChartedOnly(false);
+  }, [open]);
+
+  // A request from outside the picker (the no-chart notice's action) opens it
+  // with a filter already applied. The ref makes each request fire once: the
+  // route keeps the same object after the user closes the dialog, and a
+  // re-render must not reopen what they just dismissed.
+  const handledRequest = useRef(0);
+  useEffect(() => {
+    if (!request || request.id === handledRequest.current) return;
+    handledRequest.current = request.id;
+    setQuery("");
+    setCursor(0);
+    setChartedOnly(request.chartedOnly);
+    setOpen(true);
+  }, [request]);
+
+  // Focus the search box while open, lock the page behind the dialog, and put
+  // focus back on the trigger on close so a keyboard user is never dropped on
+  // the body.
+  const wasOpen = useRef(false);
+  useEffect(() => {
+    if (!open) {
+      if (wasOpen.current) {
+        wasOpen.current = false;
+        triggerRef.current?.focus();
+      }
+      return;
+    }
+    wasOpen.current = true;
     inputRef.current?.focus();
     const prev = document.body.style.overflow;
     document.body.style.overflow = "hidden";
@@ -104,9 +254,9 @@ export default function CountryPicker({ countries, selectedIso, onPick }: Props)
     };
   }, [open]);
 
-  useEffect(() => setCursor(0), [query]);
+  useEffect(() => setCursor(0), [query, chartedOnly]);
 
-  // Keep the active option scrolled into view during keyboard navigation.
+  // Keep the active option in view during keyboard navigation.
   useEffect(() => {
     if (!open) return;
     const el = listRef.current?.querySelector<HTMLElement>(`[data-idx="${cursor}"]`);
@@ -114,36 +264,76 @@ export default function CountryPicker({ countries, selectedIso, onPick }: Props)
   }, [cursor, open]);
 
   const choose = useCallback(
-    (c: StageCountry) => {
-      onPick(c);
+    (country: StageCountry) => {
+      onPick(country);
       close();
     },
     [onPick, close]
   );
 
-  const onListKeyDown = (e: React.KeyboardEvent) => {
+  const onInputKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === "ArrowDown") {
       e.preventDefault();
-      setCursor((i) => (results.length ? (i + 1) % results.length : 0));
+      setCursor((i) => (visible.length ? (i + 1) % visible.length : 0));
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
-      setCursor((i) => (results.length ? (i - 1 + results.length) % results.length : 0));
-    } else if (e.key === "Enter" && results[cursor]) {
+      setCursor((i) => (visible.length ? (i - 1 + visible.length) % visible.length : 0));
+    } else if (e.key === "Home") {
       e.preventDefault();
-      choose(results[cursor]);
+      setCursor(0);
+    } else if (e.key === "End") {
+      e.preventDefault();
+      setCursor(Math.max(0, visible.length - 1));
+    } else if (e.key === "Enter" && visible[cursor]) {
+      e.preventDefault();
+      choose(visible[cursor].country);
+    }
+  };
+
+  // Escape closes from anywhere in the dialog, and Tab cycles between the only
+  // two focusable elements rather than escaping into the page behind it.
+  const onDialogKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      close();
+      return;
+    }
+    if (e.key !== "Tab") return;
+    const focusable = dialogRef.current?.querySelectorAll<HTMLElement>("input, button");
+    if (!focusable?.length) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (e.shiftKey && document.activeElement === first) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && document.activeElement === last) {
+      e.preventDefault();
+      first.focus();
     }
   };
 
   const selected = countries.find((c) => c.iso === selectedIso);
+  const emptyMessage =
+    countries.length === 0
+      ? "Loading countries…"
+      : query.trim()
+        ? chartedOnly
+          ? `No charted country matches “${query.trim()}”.`
+          : `No country matches “${query.trim()}”.`
+        : chartedOnly
+          ? "No charted countries are available."
+          : "No countries are available.";
 
   return (
     <>
       <button
+        ref={triggerRef}
         type="button"
         onClick={() => setOpen(true)}
         aria-haspopup="dialog"
         aria-expanded={open}
-        className="glass group flex h-9 items-center gap-2 rounded-xl pr-2.5 pl-2.5 text-[12.5px] transition hover:border-line-bright"
+        aria-label={selected ? `Change country, currently ${selected.name}` : "Pick a country"}
+        className="btn btn-quiet h-9 gap-2 px-2.5 text-small"
       >
         {selected ? (
           <>
@@ -156,125 +346,153 @@ export default function CountryPicker({ countries, selectedIso, onPick }: Props)
             <span className="text-muted">Pick a country</span>
           </>
         )}
-        <kbd className="ml-1 hidden rounded border border-line px-1.5 py-0.5 text-[10px] text-faint sm:inline">
-          ⌘K
-        </kbd>
+        <kbd className="kbd ml-1 hidden sm:inline-flex">⌘K</kbd>
       </button>
 
-      {open ? (
-        <div className="fixed inset-0 z-50 flex items-start justify-center px-4 pt-[12vh] sm:pt-[16vh]">
-          <button
-            type="button"
-            aria-label="Close country picker"
-            onClick={close}
-            className="absolute inset-0 bg-void/80 backdrop-blur-sm motion-safe:animate-fade"
-          />
-          <div
-            role="dialog"
-            aria-modal="true"
-            aria-label="Pick a country"
-            className="lit glass relative w-full max-w-lg overflow-hidden rounded-panel shadow-lift motion-safe:animate-rise"
-          >
-            <div className="flex items-center gap-2.5 border-b border-line px-4 py-3">
-              <Search className="h-4 w-4 shrink-0 text-faint" />
-              <input
-                ref={inputRef}
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                onKeyDown={onListKeyDown}
-                role="combobox"
-                aria-expanded="true"
-                aria-controls={listId}
-                aria-activedescendant={results[cursor] ? `${listId}-opt` : undefined}
-                aria-autocomplete="list"
-                placeholder="Search 236 countries…"
-                className="min-w-0 flex-1 bg-transparent text-[14px] text-ink outline-none placeholder:text-faint"
-              />
+      {open
+        ? createPortal(
+            <div className="fixed inset-0 z-50 flex items-start justify-center px-4 pt-[12vh] sm:pt-[16vh]">
               <button
                 type="button"
+                tabIndex={-1}
+                aria-label="Close country picker"
                 onClick={close}
-                aria-label="Close"
-                className="grid h-6 w-6 shrink-0 place-items-center rounded-md text-faint transition hover:bg-raised hover:text-ink"
+                className="absolute inset-0 bg-void/78 motion-safe:animate-fade"
+              />
+              <div
+                ref={dialogRef}
+                role="dialog"
+                aria-modal="true"
+                aria-label="Pick a country"
+                data-charted-only={chartedOnly ? "true" : "false"}
+                onKeyDown={onDialogKeyDown}
+                className="surface-pop relative w-full max-w-lg overflow-hidden motion-safe:animate-rise"
               >
-                <X className="h-3.5 w-3.5" />
-              </button>
-            </div>
+                <div className="flex items-center gap-2.5 border-b border-line px-4 py-3 ring-inset transition-colors focus-within:bg-raised/30 focus-within:ring-1 focus-within:ring-accent/35">
+                  <Search className="h-4 w-4 shrink-0 text-faint" />
+                  <input
+                    ref={inputRef}
+                    value={query}
+                    onChange={(e) => setQuery(e.target.value)}
+                    onKeyDown={onInputKeyDown}
+                    role="combobox"
+                    aria-expanded="true"
+                    aria-controls={listId}
+                    aria-activedescendant={visible[cursor] ? `${listId}-opt-${cursor}` : undefined}
+                    aria-autocomplete="list"
+                    aria-label="Search countries"
+                    placeholder={
+                      countries.length > 0
+                        ? chartedOnly
+                          ? "Search charted countries…"
+                          : `Search ${countries.length} countries…`
+                        : "Search countries…"
+                    }
+                    className="min-w-0 flex-1 bg-transparent text-body text-ink outline-none placeholder:text-faint"
+                  />
+                  {chartedOnly ? (
+                    <button
+                      type="button"
+                      onClick={() => setChartedOnly(false)}
+                      title="Show all countries, including those without an official chart"
+                      className="chip shrink-0"
+                    >
+                      Charted only
+                      <X className="h-3 w-3" aria-hidden />
+                      <span className="sr-only">, show all countries</span>
+                    </button>
+                  ) : null}
+                  <button
+                    type="button"
+                    onClick={close}
+                    aria-label="Close"
+                    className="grid h-6 w-6 shrink-0 place-items-center rounded-[0.3125rem] text-faint transition hover:bg-raised hover:text-ink"
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </button>
+                </div>
 
-            <ul
-              ref={listRef}
-              id={listId}
-              role="listbox"
-              aria-label="Countries"
-              className="max-h-[52vh] overflow-y-auto overscroll-contain p-1.5"
-            >
-              {results.length === 0 ? (
-                <li className="px-3 py-8 text-center text-[13px] text-muted">
-                  No country matches “{query}”.
-                </li>
-              ) : null}
-
-              {grouped
-                ? (() => {
-                    let idx = 0;
-                    return grouped.map(({ region, items }) => {
-                      const start = idx;
-                      idx += items.length;
-                      return (
-                        <li key={region}>
-                          <p className="px-2.5 pt-2.5 pb-1 text-[10px] font-semibold tracking-[0.12em] text-faint uppercase">
+                <div
+                  ref={listRef}
+                  id={listId}
+                  role="listbox"
+                  aria-label="Countries"
+                  className="max-h-[52vh] overflow-y-auto overscroll-contain p-1.5"
+                >
+                  {grouped
+                    ? grouped.map(({ region, items, start }) => (
+                        <div key={region} role="group" aria-label={region}>
+                          <p className="eyebrow px-2.5 pt-2.5 pb-1">
                             {region}
                             <span className="tnum ml-1.5 text-faint/60">{items.length}</span>
                           </p>
-                          <ul role="group" aria-label={region}>
-                            {items.map((c, i) => (
-                              <Option
-                                key={c.iso}
-                                listId={listId}
-                                country={c}
-                                idx={start + i}
-                                active={start + i === cursor}
-                                selected={c.iso === selectedIso}
-                                onHover={setCursor}
-                                onChoose={choose}
-                              />
-                            ))}
-                          </ul>
-                        </li>
-                      );
-                    });
-                  })()
-                : results.map((c, i) => (
-                    <Option
-                      key={c.iso}
-                      listId={listId}
-                      country={c}
-                      idx={i}
-                      active={i === cursor}
-                      selected={c.iso === selectedIso}
-                      onHover={setCursor}
-                      onChoose={choose}
-                    />
-                  ))}
-            </ul>
+                          {items.map((entry, i) => (
+                            <Option
+                              key={entry.country.iso}
+                              listId={listId}
+                              entry={entry}
+                              idx={start + i}
+                              active={start + i === cursor}
+                              selected={entry.country.iso === selectedIso}
+                              onHover={setCursor}
+                              onChoose={choose}
+                            />
+                          ))}
+                        </div>
+                      ))
+                    : results.map((entry, i) => (
+                        <Option
+                          key={entry.country.iso}
+                          listId={listId}
+                          entry={entry}
+                          idx={i}
+                          active={i === cursor}
+                          selected={entry.country.iso === selectedIso}
+                          onHover={setCursor}
+                          onChoose={choose}
+                        />
+                      ))}
+                </div>
 
-            <div className="flex items-center justify-between border-t border-line px-4 py-2 text-[10.5px] text-faint">
-              <span className="flex items-center gap-1.5">
-                <kbd className="rounded border border-line px-1">↑↓</kbd> move
-                <kbd className="rounded border border-line px-1">↵</kbd> select
-                <kbd className="rounded border border-line px-1">esc</kbd> close
-              </span>
-              <span className="tnum">{results.length} countries</span>
-            </div>
-          </div>
-        </div>
-      ) : null}
+                {visible.length === 0 ? (
+                  <p role="status" className="px-3 py-8 text-center text-small text-muted">
+                    {emptyMessage}
+                  </p>
+                ) : null}
+
+                <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1.5 border-t border-line px-4 py-2 text-micro text-faint">
+                  <span className="hidden items-center gap-1.5 sm:flex">
+                    <kbd className="kbd">↑↓</kbd> move
+                    <kbd className="kbd">↵</kbd> select
+                    <kbd className="kbd">esc</kbd> close
+                  </span>
+                  {chartedOnly ? (
+                    <span className="tnum">{available.length} charted</span>
+                  ) : (
+                    <span className="flex items-center gap-3">
+                      <span className="flex items-center gap-1.5">
+                        <span aria-hidden className="h-1.5 w-1.5 rounded-full bg-muted" />
+                        Charted
+                      </span>
+                      <span className="flex items-center gap-1.5">
+                        <span aria-hidden className="h-1.5 w-1.5 rounded-full border border-faint/70" />
+                        Uncharted
+                      </span>
+                    </span>
+                  )}
+                </div>
+              </div>
+            </div>,
+            document.body
+          )
+        : null}
     </>
   );
 }
 
 function Option({
   listId,
-  country,
+  entry,
   idx,
   active,
   selected,
@@ -282,40 +500,47 @@ function Option({
   onChoose,
 }: {
   listId: string;
-  country: StageCountry;
+  entry: Entry;
   idx: number;
   active: boolean;
   selected: boolean;
   onHover: (idx: number) => void;
-  onChoose: (c: StageCountry) => void;
+  onChoose: (country: StageCountry) => void;
 }) {
+  const { country } = entry;
+  const charted = isChartCountry(country.iso);
+
   return (
-    <li role="option" aria-selected={active} id={`${listId}-opt`} data-idx={idx}>
-      <button
-        type="button"
-        onClick={() => onChoose(country)}
-        onMouseMove={() => onHover(idx)}
-        className={`flex w-full items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-left transition ${
-          active ? "bg-accent/12 text-ink" : "text-muted hover:bg-raised"
-        }`}
-      >
-        <CountryMark iso={country.iso} region={country.region} size="sm" />
-        <span className="min-w-0 flex-1 truncate text-[13px]">{country.name}</span>
-        {isChartCountry(country.iso) ? (
-          <span
-            title="Has its own weekly chart"
-            className="shrink-0 text-faint"
-            aria-label="Has its own weekly chart"
-          >
-            <Sparkles className="h-3 w-3" />
-          </span>
-        ) : (
-          <span title="Uses the Spotify fallback" aria-label="Uses the Spotify fallback">
-            <Globe2 className="h-3 w-3 text-faint/50" />
-          </span>
-        )}
-        {selected ? <Check className="h-3.5 w-3.5 shrink-0 text-accent" /> : null}
-      </button>
-    </li>
+    <div
+      role="option"
+      id={`${listId}-opt-${idx}`}
+      data-idx={idx}
+      data-iso={country.iso}
+      aria-selected={selected}
+      aria-label={`${country.name}, ${charted ? "has an official chart" : "no official chart"}`}
+      onClick={() => onChoose(country)}
+      onMouseDown={(e) => e.preventDefault()}
+      onMouseMove={() => onHover(idx)}
+      className={`flex cursor-pointer items-center gap-2.5 rounded-control px-2.5 py-1.5 text-left transition ${
+        active ? "bg-raised text-ink" : "text-muted hover:bg-raised/60"
+      }`}
+    >
+      <CountryMark iso={country.iso} region={country.region} size="sm" />
+      <span className={`min-w-0 flex-1 truncate text-small ${selected ? "text-ink" : ""}`}>
+        {country.name}
+      </span>
+      {/* Quiet availability mark: filled for a country with an official chart,
+          hollow for one without. The footer legend names both. */}
+      <span aria-hidden className="grid w-3 shrink-0 place-items-center">
+        <span
+          className={`h-1.5 w-1.5 rounded-full ${
+            charted ? "bg-muted" : "border border-faint/70"
+          }`}
+        />
+      </span>
+      <span className="grid w-3.5 shrink-0 place-items-center">
+        {selected ? <Check aria-hidden className="h-3.5 w-3.5 text-accent" /> : null}
+      </span>
+    </div>
   );
 }

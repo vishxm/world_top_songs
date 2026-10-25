@@ -5,25 +5,9 @@
 // Yields per-country WEEKLY Top Songs (audio) + Top Videos + Trending,
 // each with rank movement and the exact chart week.
 
-export type Trend = "up" | "down" | "same" | "new";
+import type { ChartTrack, ChartWeek, Trend } from "./chartTypes";
 
-export interface ChartTrack {
-  rank: number;
-  videoId: string;
-  title: string;
-  artists: string;
-  weeklyViews: number;
-  thumbnail: string;
-  previousRank: number | null;
-  weeksOnChart: number | null;
-  trend: Trend;
-}
-
-export interface ChartWeek {
-  id: string;
-  start: string;
-  end: string;
-}
+export type { ChartTrack, ChartWeek, Trend } from "./chartTypes";
 
 export interface CountryCharts {
   country: string;

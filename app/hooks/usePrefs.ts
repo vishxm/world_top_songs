@@ -32,7 +32,10 @@ export function useMediaQuery(query: string): boolean {
 }
 
 /** localStorage-backed state that never throws (private mode, SSR, quota).
- *  The stored string is untrusted, so the initial value stays the type anchor. */
+ *  The stored string is untrusted, so the initial value stays the type anchor.
+ *  `hydrated` lets callers wait for the stored value before acting on the
+ *  placeholder — the first-visit bootstrap must not overwrite a stored country
+ *  with the default just because the read effect has not run yet. */
 export function useStoredState(key: string, initial: string) {
   const [value, setValue] = useState<string>(initial);
   const [hydrated, setHydrated] = useState(false);
@@ -56,5 +59,5 @@ export function useStoredState(key: string, initial: string) {
     }
   }, [key, value, hydrated]);
 
-  return [value, setValue] as const;
+  return [value, setValue, hydrated] as const;
 }

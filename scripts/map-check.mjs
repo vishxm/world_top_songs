@@ -11,7 +11,7 @@ import booleanPointInPolygon from "@turf/boolean-point-in-polygon";
 import area from "@turf/area";
 import { difference } from "@turf/difference";
 
-const file = process.argv[2] ?? "public/world-50m.geojson";
+const file = process.argv[2] ?? "data/maps/world-50m.geojson";
 const fc = JSON.parse(readFileSync(file, "utf8"));
 const feats = fc.features;
 const byName = (n) => feats.find((f) => f.properties?.NAME === n);

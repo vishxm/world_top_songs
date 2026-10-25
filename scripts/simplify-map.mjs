@@ -2,9 +2,9 @@
 // every pointermove freezes the page (40 hovers -> 30 longtasks). This cuts
 // vertex count while keeping the Survey-of-India Kashmir claim intact.
 // Usage: node scripts/simplify-map.mjs
-// Input: public/world-50m.geojson (source of truth, never modified)
-// Output: public/world-50m-simple.geojson (what the globe renders)
-// Gate: node scripts/map-check.mjs public/world-50m-simple.geojson (must pass)
+// Input: data/maps/world-50m.geojson (source of truth, never modified)
+// Output: data/maps/world-50m-simple.geojson (the render map)
+// Gate: node scripts/map-check.mjs data/maps/world-50m-simple.geojson (must pass)
 import { readFileSync, writeFileSync } from "node:fs";
 import { simplify } from "@turf/simplify";
 
@@ -15,7 +15,7 @@ const TOL_TRIO = 0.002;
 const TOL_REST = 0.02;
 const TRIO = new Set(["India", "Pakistan", "China"]);
 
-const src = JSON.parse(readFileSync("public/world-50m.geojson", "utf8"));
+const src = JSON.parse(readFileSync("data/maps/world-50m.geojson", "utf8"));
 
 function roundCoords(c) {
   if (typeof c[0] === "number") return [Math.round(c[0] * 1e4) / 1e4, Math.round(c[1] * 1e4) / 1e4];
@@ -53,5 +53,5 @@ const features = src.features.map((f) => {
   return s;
 });
 
-writeFileSync("public/world-50m-simple.geojson", JSON.stringify({ type: "FeatureCollection", features }));
+writeFileSync("data/maps/world-50m-simple.geojson", JSON.stringify({ type: "FeatureCollection", features }));
 console.log(`verts ${before} -> ${after} (${Math.round((1 - after / before) * 100)}% fewer)`);

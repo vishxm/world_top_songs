@@ -1,34 +1,54 @@
-import type { ChartTrack, ChartWeek } from "./analyticsCharts";
+import type { ChartTrack, ChartWeek } from "./chartTypes";
 
-export interface CacheEntry {
-  tracks: ChartTrack[];
-  playlistTitle: string;
-  week: ChartWeek | null;
-  chartKind: string;
-  provider: "youtube" | "spotify";
+/**
+ * One upstream fetch returns both kinds for a country, so the cache is keyed by
+ * country and the route serialises both lists into one response. Changing tabs
+ * therefore costs neither an upstream call nor a request.
+ */
+export interface CachedCharts {
+  country: string;
+  week: ChartWeek;
+  songs: ChartTrack[];
+  videos: ChartTrack[];
   fetchedAt: number;
 }
 
-const TTL_MS = 8 * 60 * 60 * 1000; // 8h: weekly charts move slowly
+/** Weekly charts move slowly, and the upstream is unofficial and rate-limit
+ *  friendly to nobody. Eight hours is the source's own cadence, not a guess. */
+const TTL_MS = 8 * 60 * 60 * 1000;
 
-// Fresh cache (served as authoritative) + last-good cache (served stale on upstream failure).
-const fresh = new Map<string, CacheEntry>();
-const lastGood = new Map<string, CacheEntry>();
+/** Fresh: served as live while inside the TTL. */
+const fresh = new Map<string, CachedCharts>();
+/** Last good: served marked stale when the upstream fails, regardless of age. */
+const lastGood = new Map<string, CachedCharts>();
 
-export function getFresh(key: string): CacheEntry | null {
-  const e = fresh.get(key);
-  if (!e) return null;
-  if (Date.now() - e.fetchedAt > TTL_MS) return null;
-  return e;
+export function getFresh(country: string): CachedCharts | null {
+  const entry = fresh.get(country);
+  if (!entry) return null;
+  if (Date.now() - entry.fetchedAt > TTL_MS) {
+    fresh.delete(country);
+    return null;
+  }
+  return entry;
 }
 
-export function getLastGood(key: string): CacheEntry | null {
-  return lastGood.get(key) ?? null;
+export function getLastGood(country: string): CachedCharts | null {
+  return lastGood.get(country) ?? null;
 }
 
-export function setCached(key: string, entry: Omit<CacheEntry, "fetchedAt">): CacheEntry {
-  const full = { ...entry, fetchedAt: Date.now() };
-  fresh.set(key, full);
-  lastGood.set(key, full);
-  return full;
+/** Test seam: lets the browser gate prove the no-last-good path deterministically
+ *  without depending on which countries earlier runs happened to view. */
+export function clearCached(country: string): void {
+  fresh.delete(country);
+  lastGood.delete(country);
+}
+
+export function setCached(
+  country: string,
+  charts: Pick<CachedCharts, "week" | "songs" | "videos">
+): CachedCharts {
+  const entry: CachedCharts = { country, ...charts, fetchedAt: Date.now() };
+  fresh.set(country, entry);
+  lastGood.set(country, entry);
+  return entry;
 }
