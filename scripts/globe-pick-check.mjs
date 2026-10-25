@@ -114,7 +114,7 @@ const watchErrors = (target, ignore = []) => {
     // not in the message text — so filtering the text alone let ad requests
     // fail the gate.
     if (/googleads\.g\.doubleclick\.net/.test(url)) return;
-    if (ignore.some((pattern) => pattern.test(text))) return;
+    if (ignore.some((pattern) => pattern.test(text) || pattern.test(url))) return;
     errors.push(`${text.slice(0, 160)}${url ? ` @ ${url.slice(0, 200)}` : ""}`);
   });
   return errors;
@@ -1702,7 +1702,10 @@ check(
 check("no page errors on the rail page", railErrors.length === 0, railErrors.slice(0, 3).join(" | "));
 await railPage.close();
 const routePage = await browser.newPage({ viewport: { width: 1440, height: 900 } });
-const routeErrors = watchErrors(routePage);
+// The unknown-route check deliberately lands on a 404 document, and Chromium
+// logs the document itself as a failed resource. Ignore that one URL; any other
+// failed resource on this page is still an error.
+const routeErrors = watchErrors(routePage, [/\/no-such-page$/]);
 
 // ---------------------------------------------------------------------------
 // 10. Bad links must land somewhere real and explain themselves. Unknown paths

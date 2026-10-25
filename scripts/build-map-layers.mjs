@@ -19,11 +19,11 @@
 // ever visual.
 //
 // Usage:  node scripts/build-map-layers.mjs
-// Input:  public/world-50m-simple.geojson (what the globe renders; winding-correct)
+// Input:  data/maps/world-50m-simple.geojson (the render map the layers are cut from)
 // Gate:   node scripts/map-layers-check.mjs (must pass)
 import { readFileSync, writeFileSync } from "node:fs";
 
-const SRC = "public/world-50m-simple.geojson";
+const SRC = "data/maps/world-50m-simple.geojson";
 const CAPS_OUT = "public/country-caps.geojson";
 const BORDERS_OUT = "public/country-borders.geojson";
 

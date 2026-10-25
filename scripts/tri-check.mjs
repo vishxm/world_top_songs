@@ -13,7 +13,7 @@ const { default: ConicPolygonGeometry } = await import(
   "three-conic-polygon-geometry"
 );
 
-const file = process.argv[2] ?? "public/world-50m-simple.geojson";
+const file = process.argv[2] ?? "data/maps/world-50m-simple.geojson";
 const fc = JSON.parse(readFileSync(file, "utf8"));
 
 let failed = 0;

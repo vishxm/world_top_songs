@@ -4,8 +4,8 @@
 // gains is cut from Pakistan/China, so overlaps are zero by construction.
 // Usage: node scripts/build-world-map.mjs
 // Inputs: /tmp/ne50m.geojson, /tmp/datameet_india.geojson
-// Output: public/world-50m.geojson
-// Gate: node scripts/map-check.mjs public/world-50m.geojson (must pass)
+// Output: data/maps/world-50m.geojson
+// Gate: node scripts/map-check.mjs data/maps/world-50m.geojson (must pass)
 import { readFileSync, writeFileSync } from "node:fs";
 import { union } from "@turf/union";
 import { difference } from "@turf/difference";
@@ -82,5 +82,5 @@ const out = {
     return f;
   }),
 };
-writeFileSync("public/world-50m.geojson", JSON.stringify(out));
-console.log("wrote public/world-50m.geojson");
+writeFileSync("data/maps/world-50m.geojson", JSON.stringify(out));
+console.log("wrote data/maps/world-50m.geojson");

@@ -40,7 +40,7 @@ function fetchOnce(country: string): Promise<CountryCharts> {
 function cacheable(charts: CountryCharts): CachedCharts {
   return setCached(charts.country, {
     week: charts.week,
-    // Trim before caching rather than on the way out: 69 countries × 200 tracks
+    // Trim before caching rather than on the way out: 68 countries × 200 tracks
     // is a lot of strings to keep warm for a panel that can only show 40.
     songs: charts.songs.slice(0, CHART_SIZE),
     videos: charts.videos.slice(0, CHART_SIZE),

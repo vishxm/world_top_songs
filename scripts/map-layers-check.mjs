@@ -16,7 +16,7 @@
 // Exit non-zero on any failure.
 import { readFileSync } from "node:fs";
 
-const SRC = "public/world-50m-simple.geojson";
+const SRC = "data/maps/world-50m-simple.geojson";
 const CAPS = "public/country-caps.geojson";
 const BORDERS = "public/country-borders.geojson";
 const PART_BUDGET = 400;

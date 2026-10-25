@@ -486,7 +486,7 @@ The globe draws two layers, both generated — never hand-edit them:
   Kosovo, Somaliland, N. Cyprus, Siachen — stay drawn but ungrouped, so they are
   deliberately unselectable rather than silently assigned to a neighbour.
 
-Regenerate with `npm run map:layers` (after changing `world-50m-simple.geojson`).
+Regenerate with `npm run map:layers` (after changing `data/maps/world-50m-simple.geojson`).
 Gate with `npm run check:map`; it asserts the part grouping reconstructs every
 selectable source polygon exactly, that no-ISO rings stay ungrouped, and that the
 named pruned islands are present in the land grouping but absent from the caps.
